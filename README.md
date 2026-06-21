@@ -13,7 +13,8 @@ The student teams developed a variety of tools that could help realize the pipel
 
 ###Potential use:
 
-•	Provides baseline segmentation models and training scripts for cine-loop data. 
+•	Provides baseline segmentation models and training scripts for cine-loop data.
+
 •	Supports multiple architectures, enabling comparison with more advanced models. 
 •	Can be fine-tuned on SPLEEN-US images to generate initial masks for proofreading.
 
