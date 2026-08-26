@@ -110,3 +110,46 @@ estimate evolves and converges as more of the tail is included), call
 Tunable knobs specific to this variant: `WINDOW_BINS`, `WINDOW_STRIDE`,
 `NUM_SUPERVISED_TAIL_WINDOWS`, `LATE_WEIGHT_POWER`,
 `AUX_DEPTH_LOSS_WEIGHT`, `PLATEAU_LOSS_WEIGHT`.
+
+## Spectral-smoothing variant
+
+`train_bottom_mua_spectral_smoothing.py` addresses a gap shared by both
+models above: every one of the 169 wavelength-specific TPSFs in an image
+is regressed completely independently, so a given wavelength's prediction
+never sees any information from its neighbors. On real predicted-vs-truth
+spectra this shows up as three symptoms: high-frequency jitter across
+wavelength (nothing enforces the physically expected spectral smoothness),
+compressed peak/trough amplitude (each wavelength's estimate has to stand
+entirely on its own TPSF instead of pooling evidence with neighbors), and
+drift at the spectral edges (a single dataset-wide TPSF input scale
+assumes uniform amplitude/SNR across wavelength, which real
+source/detector responses rarely have).
+
+This variant keeps `BottomMuaDepthResolvedNet`'s tail encoder unchanged
+and adds:
+
+1. **Per-wavelength TPSF input scale** (`estimate_per_wavelength_input_scale`,
+   `PerWavelengthNormalizedDataset`) — a length-169 scale vector instead of
+   one dataset-wide scalar, so each wavelength is normalized against its
+   own typical amplitude rather than a global one.
+2. **`SpectralSmoother`** — a residual depthwise-separable 1D convolution
+   applied across the wavelength axis, over the fused per-wavelength
+   feature vectors of one image, immediately before the regression head.
+   Every wavelength's prediction gets access to a local neighborhood
+   (`SPECTRAL_SMOOTHING_KERNEL_SIZE` wide) of the other wavelengths'
+   evidence. Its pointwise mixing weights are zero-initialized, so the
+   module starts as the identity function and can only begin contributing
+   once training shows it reduces the loss.
+3. An optional, off-by-default spectral total-variation loss
+   (`SPECTRAL_TV_LOSS_WEIGHT`) for experimentation — left at `0.0` because
+   a hard smoothness penalty can flatten genuine peaks rather than just
+   removing jitter, whereas `SpectralSmoother` gives the network a
+   structural way to be smooth without that risk.
+
+`BottomMuaSpectralNet` subclasses `BottomMuaDepthResolvedNet` and only
+overrides `forward` to insert the smoothing step, so it inherits the tail
+encoder, full-TPSF encoder, and wavelength embedding unchanged. Spectral
+mixing requires every wavelength of an image to be present together in a
+batch, which is automatically true here since each image always
+contributes exactly `N_WAVELENGTHS` contiguous rows after
+`flatten_image_batch`, regardless of `IMAGE_BATCH_SIZE`.
