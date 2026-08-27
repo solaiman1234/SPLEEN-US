@@ -13,7 +13,13 @@ Each image contains:
 For each wavelength-specific TPSF:
     full raw TPSF -> full convolution encoder (TemporalEncoder)
     raw TPSF tail -> depth-resolved sequence encoder (DepthResolvedTailEncoder)
-    normalized wavelength -> small nonlinear wavelength embedding
+    raw wavelength -> one direct scalar, no wavelength encoder
+
+The wavelength is concatenated into the fused feature vector as-is (the
+true physical value, not a normalized or learned-embedded one), so the
+regression head is directly supervised by each TPSF's actual wavelength
+instead of by an intermediate representation invented by a small
+sub-network trained on nothing but that one scalar.
 
 Depth-resolved tail encoding: in a diffusive medium, photons collected at
 progressively later times in a DTOF have, on average, travelled deeper
@@ -106,7 +112,6 @@ TEMPORAL_POOL_BINS = 4
 TEMPORAL_FEATURE_DIM = 48
 TEMPORAL_DROPOUT = 0.15
 
-WAVELENGTH_EMBEDDING_DIM = 4
 HEAD_DROPOUT = 0.15
 
 USE_TRAINING_AUGMENTATION = True
@@ -474,7 +479,7 @@ class PerWavelengthNormalizedDataset(Dataset):
     dataset-wide scalar.
     """
 
-    def __init__(self, file_list, per_wavelength_scale, normalized_wavelengths, augment=False):
+    def __init__(self, file_list, per_wavelength_scale, wavelength_values, augment=False):
         self.file_list = list(file_list)
         self.augment = bool(augment)
 
@@ -487,14 +492,14 @@ class PerWavelengthNormalizedDataset(Dataset):
             )
         self.per_wavelength_scale = per_wavelength_scale
 
-        normalized_wavelengths = np.asarray(normalized_wavelengths, dtype=np.float32)
+        wavelength_values = np.asarray(wavelength_values, dtype=np.float32)
         expected_wavelength_shape = (N_WAVELENGTHS, 1)
-        if normalized_wavelengths.shape != expected_wavelength_shape:
+        if wavelength_values.shape != expected_wavelength_shape:
             raise ValueError(
-                f"normalized_wavelengths has shape {normalized_wavelengths.shape}; "
+                f"wavelength_values has shape {wavelength_values.shape}; "
                 f"expected {expected_wavelength_shape}."
             )
-        self.wavelengths = torch.from_numpy(normalized_wavelengths)
+        self.wavelengths = torch.from_numpy(wavelength_values)
 
     def __len__(self):
         return len(self.file_list)
@@ -864,9 +869,14 @@ def spectral_total_variation_loss(prediction, n_wavelengths=N_WAVELENGTHS):
 # ============================================================
 
 class BottomMuaSpectralNet(nn.Module):
-    """Full-TPSF features + depth-resolved tail sequence + wavelength
-    embedding, spectrally smoothed across the wavelength axis before the
+    """Full-TPSF features + depth-resolved tail sequence + raw wavelength
+    scalar, spectrally smoothed across the wavelength axis before the
     regression head.
+
+    The wavelength enters the head as a direct scalar rather than through a
+    learned embedding, so the regression head is supervised directly by the
+    true wavelength of each TPSF instead of by an intermediate learned
+    representation the model invents on its own.
     """
 
     def __init__(
@@ -877,7 +887,6 @@ class BottomMuaSpectralNet(nn.Module):
         temporal_dropout=TEMPORAL_DROPOUT,
         head_dropout=HEAD_DROPOUT,
         depth_hidden_dim=DEPTH_HIDDEN_DIM,
-        wavelength_embedding_dim=WAVELENGTH_EMBEDDING_DIM,
         num_supervised_windows=NUM_SUPERVISED_TAIL_WINDOWS,
         spectral_kernel_size=SPECTRAL_SMOOTHING_KERNEL_SIZE,
     ):
@@ -898,13 +907,9 @@ class BottomMuaSpectralNet(nn.Module):
             dropout=temporal_dropout,
         )
 
-        self.wavelength_encoder = nn.Sequential(
-            nn.Linear(1, 8),
-            nn.ReLU(),
-            nn.Linear(8, wavelength_embedding_dim),
-        )
-
-        fused_dim = temporal_feature_dim + depth_hidden_dim + wavelength_embedding_dim
+        # +1 for the raw wavelength scalar, concatenated directly (no
+        # learned encoder) below.
+        fused_dim = temporal_feature_dim + depth_hidden_dim + 1
 
         self.spectral_smoother = SpectralSmoother(fused_dim, kernel_size=spectral_kernel_size)
 
@@ -978,12 +983,10 @@ class BottomMuaSpectralNet(nn.Module):
 
         tail_final_features, supervised_profiles = self.encode_raw_tails(tpsf, late_start)
 
-        wavelength_embedding = self.wavelength_encoder(
-            wavelength.to(dtype=full_features.dtype)
-        )
+        wavelength_input = wavelength.to(dtype=full_features.dtype)
 
         fused_features = torch.cat(
-            [full_features, tail_final_features, wavelength_embedding], dim=1
+            [full_features, tail_final_features, wavelength_input], dim=1
         )
         fused_features = self.spectral_smoother(fused_features)
 
@@ -1086,13 +1089,13 @@ def train_spectral_model():
     train_dataset = PerWavelengthNormalizedDataset(
         file_list=train_files,
         per_wavelength_scale=per_wavelength_scale,
-        normalized_wavelengths=normalized_wavelengths,
+        wavelength_values=raw_wavelengths,
         augment=USE_TRAINING_AUGMENTATION,
     )
     val_dataset = PerWavelengthNormalizedDataset(
         file_list=val_files,
         per_wavelength_scale=per_wavelength_scale,
-        normalized_wavelengths=normalized_wavelengths,
+        wavelength_values=raw_wavelengths,
         augment=False,
     )
 

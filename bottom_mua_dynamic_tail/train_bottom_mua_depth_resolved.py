@@ -66,7 +66,6 @@ from train_bottom_mua_dynamic_tail import (
     TEMPORAL_POOL_BINS,
     TRAIN_DIR,
     TRAIN_FRACTION,
-    WAVELENGTH_EMBEDDING_DIM,
     WAVELENGTH_FILE,
     WEIGHT_DECAY,
     BottomMuaDataset,
@@ -259,7 +258,14 @@ class DepthResolvedTailEncoder(nn.Module):
 # ============================================================
 
 class BottomMuaDepthResolvedNet(nn.Module):
-    """Full TPSF features + depth-resolved tail sequence + wavelength embedding."""
+    """Full TPSF features + depth-resolved tail sequence + raw wavelength
+    scalar.
+
+    The wavelength enters the head as a direct scalar rather than through a
+    learned embedding, so the regression head is supervised directly by the
+    true wavelength of each TPSF instead of by an intermediate learned
+    representation the model invents on its own.
+    """
 
     def __init__(
         self,
@@ -269,7 +275,6 @@ class BottomMuaDepthResolvedNet(nn.Module):
         temporal_dropout=TEMPORAL_DROPOUT,
         head_dropout=HEAD_DROPOUT,
         depth_hidden_dim=DEPTH_HIDDEN_DIM,
-        wavelength_embedding_dim=WAVELENGTH_EMBEDDING_DIM,
         num_supervised_windows=NUM_SUPERVISED_TAIL_WINDOWS,
     ):
         super().__init__()
@@ -289,13 +294,9 @@ class BottomMuaDepthResolvedNet(nn.Module):
             dropout=temporal_dropout,
         )
 
-        self.wavelength_encoder = nn.Sequential(
-            nn.Linear(1, 8),
-            nn.ReLU(),
-            nn.Linear(8, wavelength_embedding_dim),
-        )
-
-        fused_dim = temporal_feature_dim + depth_hidden_dim + wavelength_embedding_dim
+        # +1 for the raw wavelength scalar, concatenated directly (no
+        # learned encoder) below.
+        fused_dim = temporal_feature_dim + depth_hidden_dim + 1
 
         self.head = nn.Sequential(
             nn.Linear(fused_dim, 64),
@@ -376,12 +377,10 @@ class BottomMuaDepthResolvedNet(nn.Module):
             tpsf, late_start
         )
 
-        wavelength_embedding = self.wavelength_encoder(
-            wavelength.to(dtype=full_features.dtype)
-        )
+        wavelength_input = wavelength.to(dtype=full_features.dtype)
 
         fused_features = torch.cat(
-            [full_features, tail_final_features, wavelength_embedding],
+            [full_features, tail_final_features, wavelength_input],
             dim=1,
         )
 
@@ -516,13 +515,13 @@ def train_depth_resolved_model():
     train_dataset = BottomMuaDataset(
         file_list=train_files,
         tpsf_input_scale=tpsf_input_scale,
-        normalized_wavelengths=normalized_wavelengths,
+        wavelength_values=raw_wavelengths,
         augment=True,
     )
     val_dataset = BottomMuaDataset(
         file_list=val_files,
         tpsf_input_scale=tpsf_input_scale,
-        normalized_wavelengths=normalized_wavelengths,
+        wavelength_values=raw_wavelengths,
         augment=False,
     )
 

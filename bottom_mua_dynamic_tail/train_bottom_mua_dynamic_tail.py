@@ -14,11 +14,15 @@ For each wavelength-specific TPSF:
     full/tail TPSF -> low-order statistical moments (mean/variance/skew/
         peak amplitude/peak time/total counts), used directly as auxiliary
         features
-    normalized wavelength -> small nonlinear wavelength embedding
+    raw wavelength -> one direct scalar, no wavelength encoder
 
 The full/tail convolutional features, the full/tail moment features, and the
-wavelength embedding are concatenated and used to predict the corresponding
-bottom-layer absorption coefficient.
+raw wavelength scalar are concatenated and used to predict the corresponding
+bottom-layer absorption coefficient. The wavelength is not passed through a
+learned encoder: it enters the head as-is, so the head is supervised
+directly by each TPSF's true wavelength rather than by an intermediate
+representation invented by a small sub-network trained on nothing but that
+one scalar.
 
 The tail is TPSF[LATE_START:300] exactly. There is no interpolation,
 resampling, padding, tail mask, or LATE_START feature encoder.
@@ -36,9 +40,9 @@ Changes relative to the original single-scalar-wavelength version:
        numerically stable signal that is not solely dependent on what the
        convolutional encoders learn from a limited number of training
        images.
-    3. Replaced the raw wavelength scalar with a small nonlinear MLP
-       embedding, since chromophore absorption spectra are not linear in
-       wavelength.
+    3. Uses each TPSF's true (un-normalized) wavelength as the direct
+       scalar, rather than a min-max normalized value, so the head is
+       supervised by the actual physical wavelength.
     4. Increased the default per-step image batch size so that gradients
        are averaged over TPSFs drawn from more than one phantom/image at a
        time, reducing gradient variance from within-image correlation.
@@ -110,7 +114,6 @@ TEMPORAL_FEATURE_DIM = 48
 TEMPORAL_DROPOUT = 0.15
 
 MOMENT_FEATURE_DIM = 6
-WAVELENGTH_EMBEDDING_DIM = 4
 
 HEAD_DROPOUT = 0.15
 
@@ -488,26 +491,26 @@ class BottomMuaDataset(Dataset):
         self,
         file_list,
         tpsf_input_scale,
-        normalized_wavelengths,
+        wavelength_values,
         augment=False,
     ):
         self.file_list = list(file_list)
         self.tpsf_input_scale = float(tpsf_input_scale)
         self.augment = bool(augment)
 
-        normalized_wavelengths = np.asarray(
-            normalized_wavelengths,
+        wavelength_values = np.asarray(
+            wavelength_values,
             dtype=np.float32,
         )
 
         expected = (N_WAVELENGTHS, 1)
-        if normalized_wavelengths.shape != expected:
+        if wavelength_values.shape != expected:
             raise ValueError(
-                f"normalized_wavelengths has shape "
-                f"{normalized_wavelengths.shape}; expected {expected}."
+                f"wavelength_values has shape "
+                f"{wavelength_values.shape}; expected {expected}."
             )
 
-        self.wavelengths = torch.from_numpy(normalized_wavelengths)
+        self.wavelengths = torch.from_numpy(wavelength_values)
 
     def __len__(self):
         return len(self.file_list)
@@ -752,7 +755,7 @@ class TemporalEncoder(nn.Module):
 
 
 class BottomMuaSimpleFullTailNet(nn.Module):
-    """Full TPSF features + raw-tail features + moments + wavelength embedding."""
+    """Full TPSF features + raw-tail features + moments + raw wavelength scalar."""
 
     def __init__(
         self,
@@ -762,7 +765,6 @@ class BottomMuaSimpleFullTailNet(nn.Module):
         temporal_dropout=TEMPORAL_DROPOUT,
         head_dropout=HEAD_DROPOUT,
         moment_feature_dim=MOMENT_FEATURE_DIM,
-        wavelength_embedding_dim=WAVELENGTH_EMBEDDING_DIM,
     ):
         super().__init__()
 
@@ -785,16 +787,13 @@ class BottomMuaSimpleFullTailNet(nn.Module):
             dropout=temporal_dropout,
         )
 
-        self.wavelength_encoder = nn.Sequential(
-            nn.Linear(1, 8),
-            nn.ReLU(),
-            nn.Linear(8, wavelength_embedding_dim),
-        )
-
+        # +1 for the raw wavelength scalar, concatenated directly below
+        # (no learned encoder) so the head is supervised by the true
+        # wavelength value rather than an intermediate representation.
         fused_dim = (
             2 * temporal_feature_dim
             + 2 * self.moment_feature_dim
-            + wavelength_embedding_dim
+            + 1
         )
 
         self.head = nn.Sequential(
@@ -930,9 +929,7 @@ class BottomMuaSimpleFullTailNet(nn.Module):
             late_start,
         )
 
-        wavelength_embedding = self.wavelength_encoder(
-            wavelength.to(dtype=full_features.dtype)
-        )
+        wavelength_input = wavelength.to(dtype=full_features.dtype)
 
         fused_features = torch.cat(
             [
@@ -940,7 +937,7 @@ class BottomMuaSimpleFullTailNet(nn.Module):
                 tail_features,
                 full_moments,
                 tail_moments,
-                wavelength_embedding,
+                wavelength_input,
             ],
             dim=1,
         )
@@ -1120,14 +1117,14 @@ def train_model():
     train_dataset = BottomMuaDataset(
         file_list=train_files,
         tpsf_input_scale=tpsf_input_scale,
-        normalized_wavelengths=normalized_wavelengths,
+        wavelength_values=raw_wavelengths,
         augment=USE_TRAINING_AUGMENTATION,
     )
 
     val_dataset = BottomMuaDataset(
         file_list=val_files,
         tpsf_input_scale=tpsf_input_scale,
-        normalized_wavelengths=normalized_wavelengths,
+        wavelength_values=raw_wavelengths,
         augment=False,
     )
 
@@ -1382,9 +1379,8 @@ def train_model():
         "temporal_pool_bins": TEMPORAL_POOL_BINS,
         "temporal_feature_dim": TEMPORAL_FEATURE_DIM,
         "moment_feature_dim": MOMENT_FEATURE_DIM,
-        "wavelength_embedding_dim": WAVELENGTH_EMBEDDING_DIM,
         "tail_extraction": "raw_grouped_by_late_start",
-        "wavelength_usage": "nonlinear_embedding",
+        "wavelength_usage": "raw_scalar_direct",
         "temporal_dropout": TEMPORAL_DROPOUT,
         "head_dropout": HEAD_DROPOUT,
         "tpsf_input_scale": tpsf_input_scale,

@@ -30,10 +30,14 @@ version adds:
    optics, so they give the regression head a physically grounded, low-
    variance signal that does not depend solely on what the CNN encoders
    manage to learn from a limited number of training images.
-3. **Nonlinear wavelength embedding.** The normalized wavelength is now
-   passed through a small `Linear(1, 8) -> ReLU -> Linear(8, 4)` encoder
-   instead of being concatenated as a single raw scalar, since chromophore
-   absorption spectra are not linear functions of wavelength.
+3. **Raw wavelength as a direct scalar.** Each TPSF's true (un-normalized)
+   wavelength is concatenated straight into the fusion vector, with no
+   learned encoder in between, so the regression head is supervised
+   directly by the actual physical wavelength rather than by an
+   intermediate representation a small sub-network invents on its own. An
+   earlier version of this file routed the wavelength through a
+   `Linear(1, 8) -> ReLU -> Linear(8, 4)` embedding first; that's been
+   removed to match the original direct-scalar design.
 4. **Larger per-step image batch.** `IMAGE_BATCH_SIZE` was raised from 1 to
    4 so that each optimizer step averages gradients over TPSFs drawn from
    several different phantoms/images, reducing gradient noise from
@@ -146,10 +150,10 @@ and adds:
    removing jitter, whereas `SpectralSmoother` gives the network a
    structural way to be smooth without that risk.
 
-`BottomMuaSpectralNet` subclasses `BottomMuaDepthResolvedNet` and only
-overrides `forward` to insert the smoothing step, so it inherits the tail
-encoder, full-TPSF encoder, and wavelength embedding unchanged. Spectral
-mixing requires every wavelength of an image to be present together in a
-batch, which is automatically true here since each image always
-contributes exactly `N_WAVELENGTHS` contiguous rows after
-`flatten_image_batch`, regardless of `IMAGE_BATCH_SIZE`.
+`train_bottom_mua_spectral_smoothing.py` is fully standalone (no imports
+from the other two files in this folder) and, like them, concatenates each
+TPSF's raw wavelength directly into the fusion vector rather than through
+a learned embedding. Spectral mixing requires every wavelength of an
+image to be present together in a batch, which is automatically true here
+since each image always contributes exactly `N_WAVELENGTHS` contiguous
+rows after `flatten_image_batch`, regardless of `IMAGE_BATCH_SIZE`.
