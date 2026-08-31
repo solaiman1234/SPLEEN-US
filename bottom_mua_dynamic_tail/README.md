@@ -199,6 +199,39 @@ compressed-peak/tail-undershoot bias, or whether (per the coverage
 diagnostic below) that bias turns out to be a training-data gap that no
 amount of smoother capacity can fix.
 
+## Global-context variant
+
+Evaluating a checkpoint across phantoms at five different oxygenation
+levels showed the same qualitative error shape everywhere (compressed
+peak, undershooting trough, diverging tail), but its *magnitude* changed
+systematically with the phantom's oxygenation level, worst at the
+extremes. That pattern points at something `SpectralSmoother` cannot
+provide: real oxy-/deoxy-hemoglobin extinction spectra make the whole
+shape of a 169-wavelength curve informative about which regime a phantom
+is in, but a local convolution kernel (even stacked) has a bounded
+receptive field and structurally cannot let evidence at wavelength 0-20
+correct a prediction at wavelength 140-169.
+
+`train_bottom_mua_spectral_smoothing_global_context.py` and its matching
+`inference_bottom_mua_spectral_smoothing_global_context.py` add
+`GlobalSpectralContext` to the stacked-smoother pair: it pools the fused
+per-wavelength features across *all* 169 wavelengths of one image into a
+single per-image context vector (mean + max pooling), and uses it to
+apply a FiLM-style (feature-wise linear modulation) affine correction --
+`features * (1 + scale) + shift`, with `scale`/`shift` computed once per
+image and broadcast to every wavelength -- before local smoothing refines
+the result further. Like every other correction module in this codebase,
+its final layer is zero-initialized, so it starts as the identity
+transform and only begins contributing once training shows it reduces the
+loss.
+
+This is again a separate, independently trainable file (architecture
+identifier `bottom_mua_depth_resolved_spectral_smoothing_global_context`,
+its own default `SPECTRAL_MODEL_PATH`/`MODEL_PATH`), not a drop-in
+replacement for the single-block or stacked-only variants -- keep all
+three around to compare whether global conditioning meaningfully reduces
+the oxygenation-dependent bias the stacked-only variant left behind.
+
 ## Diagnosing a systematic (non-jitter) predicted-vs-true mismatch
 
 `SpectralSmoother` (and stacking more blocks into it) can only reshape or
