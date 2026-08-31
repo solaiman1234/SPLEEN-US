@@ -136,22 +136,14 @@ and adds:
    `PerWavelengthNormalizedDataset`) — a length-169 scale vector instead of
    one dataset-wide scalar, so each wavelength is normalized against its
    own typical amplitude rather than a global one.
-2. **`SpectralSmoother`** — a stack of `SPECTRAL_SMOOTHING_NUM_BLOCKS`
-   residual depthwise-separable 1D convolution blocks (`SpectralSmootherBlock`,
-   kernel size `SPECTRAL_SMOOTHING_KERNEL_SIZE`) applied across the
-   wavelength axis, over the fused per-wavelength feature vectors of one
-   image, immediately before the regression head. Every wavelength's
-   prediction gets access to a neighborhood of the other wavelengths'
-   evidence that widens with each block. Every block's pointwise mixing
-   weights are zero-initialized, so the whole stack starts as the identity
-   function and can only begin contributing once training shows it reduces
-   the loss. A single block was tried first and mainly removed local
-   jitter but left it at the two spectral edges (where a kernel's
-   zero-padding dilutes the neighbor context) and left the compressed-peak
-   /tail-overshoot bias essentially unchanged; stacking blocks (default 2)
-   widens the effective receptive field and gives the smoother more
-   nonlinear capacity to correct that systematic, curvature-level error
-   too, not just edge-adjacent jitter.
+2. **`SpectralSmoother`** — a residual depthwise-separable 1D convolution
+   applied across the wavelength axis, over the fused per-wavelength
+   feature vectors of one image, immediately before the regression head.
+   Every wavelength's prediction gets access to a local neighborhood
+   (`SPECTRAL_SMOOTHING_KERNEL_SIZE` wide) of the other wavelengths'
+   evidence. Its pointwise mixing weights are zero-initialized, so the
+   module starts as the identity function and can only begin contributing
+   once training shows it reduces the loss.
 3. An optional, off-by-default spectral total-variation loss
    (`SPECTRAL_TV_LOSS_WEIGHT`) for experimentation — left at `0.0` because
    a hard smoothness penalty can flatten genuine peaks rather than just
@@ -165,6 +157,47 @@ a learned embedding. Spectral mixing requires every wavelength of an
 image to be present together in a batch, which is automatically true here
 since each image always contributes exactly `N_WAVELENGTHS` contiguous
 rows after `flatten_image_batch`, regardless of `IMAGE_BATCH_SIZE`.
+
+`inference_bottom_mua_spectral_smoothing.py` is the matching standalone
+inference script: it rebuilds `BottomMuaSpectralNet` from scratch, loads a
+checkpoint this training script produced, divides each test TPSF by its
+own per-wavelength scale, and predicts on one complete test image (all
+169 wavelengths) at a time, since `SpectralSmoother` requires that. The
+model's `forward` returns `(prediction, depth_profile)`; the script saves
+both.
+
+## Stacked-smoother variant
+
+A trained checkpoint's predicted-vs-true spectrum still showed the
+compressed mid-spectrum peak and long-wavelength tail undershoot from
+before spectral smoothing was added, plus residual jitter concentrated at
+the two spectral edges — consistent with a single kernel's zero-padding
+diluting the neighbor context there. Since `SpectralSmoother` can only
+reshape/blend predictions the per-wavelength backbone already computed,
+not inject information it never learned, more smoothing capacity was
+worth trying before concluding the remaining error was a training-data
+issue (see `diagnose_target_coverage.py` below for how to check that).
+
+`train_bottom_mua_spectral_smoothing_stacked.py` and its matching
+`inference_bottom_mua_spectral_smoothing_stacked.py` are copies of the
+single-block spectral-smoothing pair with one change: `SpectralSmoother`
+is split into `SpectralSmootherBlock` (one residual depthwise-separable
+conv step) and stacked `SPECTRAL_SMOOTHING_NUM_BLOCKS` times (default 2).
+Stacking widens the effective receptive field across the wavelength axis
+and gives the smoother more nonlinear capacity to correct curvature-level
+shape errors, not just local jitter. Every block is still zero-initialized,
+so the stack still starts as an exact identity function.
+
+These are separate, independently trainable files, not a drop-in
+replacement for the single-block originals: their checkpoints use a
+different `architecture` identifier
+(`bottom_mua_depth_resolved_spectral_smoothing_stacked`) and a different
+default `MODEL_PATH`/`SPECTRAL_MODEL_PATH`, so the two variants' inference
+scripts refuse to load each other's checkpoints. Keep both pairs around to
+compare whether the extra smoothing capacity actually reduces the
+compressed-peak/tail-undershoot bias, or whether (per the coverage
+diagnostic below) that bias turns out to be a training-data gap that no
+amount of smoother capacity can fix.
 
 ## Diagnosing a systematic (non-jitter) predicted-vs-true mismatch
 
