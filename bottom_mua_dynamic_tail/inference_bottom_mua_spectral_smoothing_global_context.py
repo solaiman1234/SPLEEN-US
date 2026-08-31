@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Inference for the stacked-smoother-plus-global-context variant of the
-depth-resolved, spectrally-smoothed bottom-mua model
+Inference for the global-context variant of the depth-resolved,
+spectrally-smoothed bottom-mua model
 (train_bottom_mua_spectral_smoothing_global_context.py). Fully standalone
 -- rebuilds the exact model architecture here so a checkpoint produced by
 that training script can be loaded and run without importing it. Not
 interchangeable with checkpoints from train_bottom_mua_spectral_smoothing.py
-(single smoothing block) or train_bottom_mua_spectral_smoothing_stacked.py
-(stacked, no global context) -- this script checks the checkpoint's
-architecture identifier and refuses to load a mismatched one.
+(no global context) -- this script checks the checkpoint's architecture
+identifier and refuses to load a mismatched one.
 
 Each test image contains:
     - 169 wavelength-specific TPSFs
@@ -19,8 +18,9 @@ For each wavelength-specific TPSF:
     full raw TPSF -> full convolution encoder (TemporalEncoder)
     raw TPSF tail -> depth-resolved sequence encoder (DepthResolvedTailEncoder)
     raw wavelength -> one direct scalar, no wavelength encoder
-The fused per-wavelength features are then spectrally smoothed across all
-169 wavelengths of the image (SpectralSmoother) before the regression head.
+The fused per-wavelength features are then globally conditioned on the
+whole spectrum (GlobalSpectralContext) and locally smoothed across all 169
+wavelengths of the image (SpectralSmoother) before the regression head.
 
 Two things differ from the older single-scalar-wavelength checkpoint format
 this script's predecessor consumed:
@@ -117,7 +117,6 @@ DEFAULT_DEPTH_HIDDEN_DIM = 32
 DEFAULT_NUM_SUPERVISED_TAIL_WINDOWS = 3
 
 DEFAULT_SPECTRAL_SMOOTHING_KERNEL_SIZE = 7
-DEFAULT_SPECTRAL_SMOOTHING_NUM_BLOCKS = 2
 
 # build_tail_windows/DepthResolvedTailEncoder read these as module-level
 # defaults (not per-instance constructor state), matching how
@@ -552,36 +551,8 @@ class DepthResolvedTailEncoder(nn.Module):
 # 8. SPECTRAL SMOOTHER
 # ============================================================
 
-class SpectralSmootherBlock(nn.Module):
-    """One residual depthwise-separable smoothing step across the
-    wavelength axis.
-    """
-
-    def __init__(self, feature_dim, kernel_size):
-        super().__init__()
-
-        if kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be odd for symmetric padding.")
-
-        self.feature_dim = int(feature_dim)
-        padding = kernel_size // 2
-
-        self.depthwise = nn.Conv1d(
-            feature_dim, feature_dim, kernel_size=kernel_size,
-            padding=padding, groups=feature_dim, bias=False,
-        )
-        self.norm = nn.GroupNorm(choose_group_count(feature_dim), feature_dim)
-        self.pointwise = nn.Conv1d(feature_dim, feature_dim, kernel_size=1)
-
-    def forward(self, sequence):
-        """sequence: [n_images, feature_dim, n_wavelengths]."""
-        residual = self.pointwise(F.relu(self.norm(self.depthwise(sequence))))
-        return sequence + residual
-
-
 class SpectralSmoother(nn.Module):
-    """Stack of residual depthwise-separable smoothing blocks across the
-    wavelength axis.
+    """Residual depthwise-separable smoothing across the wavelength axis.
 
     Requires the batch to contain one or more complete images (every one
     of the N_WAVELENGTHS rows of an image present together).
@@ -591,23 +562,23 @@ class SpectralSmoother(nn.Module):
         self,
         feature_dim,
         kernel_size=DEFAULT_SPECTRAL_SMOOTHING_KERNEL_SIZE,
-        num_blocks=DEFAULT_SPECTRAL_SMOOTHING_NUM_BLOCKS,
         n_wavelengths=N_WAVELENGTHS,
     ):
         super().__init__()
 
-        if num_blocks < 1:
-            raise ValueError("num_blocks must be at least one.")
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be odd for symmetric padding.")
 
         self.feature_dim = int(feature_dim)
         self.n_wavelengths = int(n_wavelengths)
+        padding = kernel_size // 2
 
-        self.blocks = nn.ModuleList(
-            [
-                SpectralSmootherBlock(feature_dim, kernel_size)
-                for _ in range(num_blocks)
-            ]
+        self.depthwise = nn.Conv1d(
+            feature_dim, feature_dim, kernel_size=kernel_size,
+            padding=padding, groups=feature_dim, bias=False,
         )
+        self.norm = nn.GroupNorm(choose_group_count(feature_dim), feature_dim)
+        self.pointwise = nn.Conv1d(feature_dim, feature_dim, kernel_size=1)
 
     def forward(self, fused_features):
         n_total, feature_dim = fused_features.shape
@@ -627,10 +598,10 @@ class SpectralSmoother(nn.Module):
         sequence = fused_features.view(n_images, self.n_wavelengths, feature_dim)
         sequence = sequence.transpose(1, 2)
 
-        for block in self.blocks:
-            sequence = block(sequence)
+        residual = self.pointwise(F.relu(self.norm(self.depthwise(sequence))))
+        mixed = sequence + residual
 
-        mixed = sequence.transpose(1, 2).reshape(n_total, feature_dim)
+        mixed = mixed.transpose(1, 2).reshape(n_total, feature_dim)
         return mixed
 
 
@@ -708,7 +679,6 @@ class BottomMuaSpectralNet(nn.Module):
         depth_hidden_dim=DEFAULT_DEPTH_HIDDEN_DIM,
         num_supervised_windows=DEFAULT_NUM_SUPERVISED_TAIL_WINDOWS,
         spectral_kernel_size=DEFAULT_SPECTRAL_SMOOTHING_KERNEL_SIZE,
-        spectral_num_blocks=DEFAULT_SPECTRAL_SMOOTHING_NUM_BLOCKS,
     ):
         super().__init__()
 
@@ -731,9 +701,7 @@ class BottomMuaSpectralNet(nn.Module):
 
         self.global_context = GlobalSpectralContext(fused_dim)
 
-        self.spectral_smoother = SpectralSmoother(
-            fused_dim, kernel_size=spectral_kernel_size, num_blocks=spectral_num_blocks
-        )
+        self.spectral_smoother = SpectralSmoother(fused_dim, kernel_size=spectral_kernel_size)
 
         self.head = nn.Sequential(
             nn.Linear(fused_dim, 64),
@@ -890,9 +858,6 @@ def build_model_from_checkpoint(checkpoint, device):
         ),
         spectral_kernel_size=int(
             checkpoint.get("spectral_smoothing_kernel_size", DEFAULT_SPECTRAL_SMOOTHING_KERNEL_SIZE)
-        ),
-        spectral_num_blocks=int(
-            checkpoint.get("spectral_smoothing_num_blocks", DEFAULT_SPECTRAL_SMOOTHING_NUM_BLOCKS)
         ),
     ).to(device)
 

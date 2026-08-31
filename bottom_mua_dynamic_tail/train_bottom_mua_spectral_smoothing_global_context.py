@@ -41,17 +41,16 @@ bottom-layer absorption.
 Spectral coherence: all 169 wavelengths of an image are otherwise
 regressed completely independently, which on real predicted-vs-truth
 spectra shows up as high-frequency jitter, compressed peak/trough
-amplitude, and drift at the spectral edges. SpectralSmoother applies a
-stack of SPECTRAL_SMOOTHING_NUM_BLOCKS zero-initialized residual
-depthwise-separable 1D convolution blocks across the wavelength axis on
-the fused per-wavelength feature vectors, immediately before the
-regression head, so every wavelength's prediction can pool evidence from a
-neighborhood of other wavelengths instead of standing entirely on its own
-TPSF. Every block starts as the identity function and only begins
-contributing once training shows it reduces the loss. Per-wavelength TPSF
-input normalization (a length-169 scale vector instead of one
-dataset-wide scalar) is used for the same reason: real source/detector
-responses aren't uniform across wavelength.
+amplitude, and drift at the spectral edges. SpectralSmoother is a
+zero-initialized residual depthwise-separable 1D convolution applied
+across the wavelength axis on the fused per-wavelength feature vectors,
+immediately before the regression head, so every wavelength's prediction
+can pool evidence from a local neighborhood of other wavelengths instead
+of standing entirely on its own TPSF. It starts as the identity function
+and only begins contributing once training shows it reduces the loss.
+Per-wavelength TPSF input normalization (a length-169 scale vector
+instead of one dataset-wide scalar) is used for the same reason: real
+source/detector responses aren't uniform across wavelength.
 
 Global spectral context: across phantoms at different oxygenation levels,
 the predicted-vs-true error keeps the same qualitative shape (compressed
@@ -69,19 +68,11 @@ context vector, and uses it to apply a FiLM-style affine correction
 refines them further. It is zero-initialized, so it starts as the
 identity transform.
 
-This is the stacked-smoother-plus-global-context variant of
-train_bottom_mua_spectral_smoothing.py: a single smoothing block removed
-most local jitter but left it at the two spectral edges (where a kernel's
-zero-padding dilutes the neighbor context) and left the compressed-peak/
-tail-overshoot bias essentially unchanged. Stacking blocks (default
-SPECTRAL_SMOOTHING_NUM_BLOCKS = 2) widens the effective local receptive
-field; GlobalSpectralContext adds the long-range, whole-spectrum awareness
-that no amount of local-kernel stacking can provide. The earlier variants
-are kept unmodified in train_bottom_mua_spectral_smoothing.py (single
-block) and train_bottom_mua_spectral_smoothing_stacked.py (stacked, no
-global context) for comparison; this file is a separate, independently
-trainable variant, not a drop-in replacement (its checkpoints use a
-different architecture identifier and default path).
+This is the global-context variant of train_bottom_mua_spectral_smoothing.py:
+identical to that file except for the added GlobalSpectralContext stage.
+The original is kept unmodified for comparison; this file is a separate,
+independently trainable variant, not a drop-in replacement (its
+checkpoints use a different architecture identifier and default path).
 """
 
 import copy
@@ -170,12 +161,6 @@ PLATEAU_LOSS_WEIGHT = 0.05
 
 # Spectral-smoothing settings.
 SPECTRAL_SMOOTHING_KERNEL_SIZE = 7
-
-# More than one block widens the effective receptive field across the
-# wavelength axis and gives the smoother more nonlinear capacity to
-# correct systematic (curvature-level) spectral shape errors, not just
-# local jitter.
-SPECTRAL_SMOOTHING_NUM_BLOCKS = 2
 
 # Optional light total-variation penalty on the final predicted spectrum,
 # on top of the structural smoothing already performed by SpectralSmoother.
@@ -824,19 +809,23 @@ def depth_profile_auxiliary_losses(supervised_profiles, target, late_weight_powe
 # 9. SPECTRAL SMOOTHER
 # ============================================================
 
-class SpectralSmootherBlock(nn.Module):
-    """One residual depthwise-separable smoothing step across the
-    wavelength axis. Zero-initialized so it starts as the identity
-    function.
+class SpectralSmoother(nn.Module):
+    """Residual depthwise-separable smoothing across the wavelength axis.
+
+    Operates on the fused per-wavelength feature vectors of one image at a
+    time (shape [N_WAVELENGTHS, feature_dim]), giving every wavelength's
+    prediction access to a local neighborhood of the other wavelengths'
+    evidence. Zero-initialized so it starts as the identity function.
     """
 
-    def __init__(self, feature_dim, kernel_size):
+    def __init__(self, feature_dim, kernel_size=SPECTRAL_SMOOTHING_KERNEL_SIZE, n_wavelengths=N_WAVELENGTHS):
         super().__init__()
 
         if kernel_size % 2 == 0:
             raise ValueError("kernel_size must be odd for symmetric padding.")
 
         self.feature_dim = int(feature_dim)
+        self.n_wavelengths = int(n_wavelengths)
         padding = kernel_size // 2
 
         self.depthwise = nn.Conv1d(
@@ -846,54 +835,11 @@ class SpectralSmootherBlock(nn.Module):
         self.norm = nn.GroupNorm(choose_group_count(feature_dim), feature_dim)
         self.pointwise = nn.Conv1d(feature_dim, feature_dim, kernel_size=1)
 
-        # Zero-initialized pointwise mixing: at the start of training this
-        # block contributes nothing, so it is exactly the identity until
-        # training shows the mixing helps.
+        # Zero-initialized pointwise mixing: at the start of training the
+        # residual branch contributes nothing, so this module is exactly
+        # the identity until training shows the mixing helps.
         nn.init.zeros_(self.pointwise.weight)
         nn.init.zeros_(self.pointwise.bias)
-
-    def forward(self, sequence):
-        """sequence: [n_images, feature_dim, n_wavelengths]."""
-        residual = self.pointwise(F.relu(self.norm(self.depthwise(sequence))))
-        return sequence + residual
-
-
-class SpectralSmoother(nn.Module):
-    """Stack of residual depthwise-separable smoothing blocks across the
-    wavelength axis.
-
-    Operates on the fused per-wavelength feature vectors of one image at a
-    time (shape [N_WAVELENGTHS, feature_dim]), giving every wavelength's
-    prediction access to a neighborhood of the other wavelengths' evidence
-    that widens with each additional block. Every block is zero-initialized,
-    so the whole stack starts as the identity function and can only begin
-    contributing once training shows it reduces the loss. A single block
-    can only remove local jitter; stacking blocks gives the smoother more
-    nonlinear capacity to correct systematic (curvature-level, not just
-    noise-level) shape errors across the spectrum.
-    """
-
-    def __init__(
-        self,
-        feature_dim,
-        kernel_size=SPECTRAL_SMOOTHING_KERNEL_SIZE,
-        num_blocks=SPECTRAL_SMOOTHING_NUM_BLOCKS,
-        n_wavelengths=N_WAVELENGTHS,
-    ):
-        super().__init__()
-
-        if num_blocks < 1:
-            raise ValueError("num_blocks must be at least one.")
-
-        self.feature_dim = int(feature_dim)
-        self.n_wavelengths = int(n_wavelengths)
-
-        self.blocks = nn.ModuleList(
-            [
-                SpectralSmootherBlock(feature_dim, kernel_size)
-                for _ in range(num_blocks)
-            ]
-        )
 
     def forward(self, fused_features):
         n_total, feature_dim = fused_features.shape
@@ -915,10 +861,10 @@ class SpectralSmoother(nn.Module):
         sequence = fused_features.view(n_images, self.n_wavelengths, feature_dim)
         sequence = sequence.transpose(1, 2)  # [n_images, feature_dim, n_wavelengths]
 
-        for block in self.blocks:
-            sequence = block(sequence)
+        residual = self.pointwise(F.relu(self.norm(self.depthwise(sequence))))
+        mixed = sequence + residual
 
-        mixed = sequence.transpose(1, 2).reshape(n_total, feature_dim)
+        mixed = mixed.transpose(1, 2).reshape(n_total, feature_dim)
         return mixed
 
 
@@ -1044,7 +990,6 @@ class BottomMuaSpectralNet(nn.Module):
         depth_hidden_dim=DEPTH_HIDDEN_DIM,
         num_supervised_windows=NUM_SUPERVISED_TAIL_WINDOWS,
         spectral_kernel_size=SPECTRAL_SMOOTHING_KERNEL_SIZE,
-        spectral_num_blocks=SPECTRAL_SMOOTHING_NUM_BLOCKS,
     ):
         super().__init__()
 
@@ -1069,9 +1014,7 @@ class BottomMuaSpectralNet(nn.Module):
 
         self.global_context = GlobalSpectralContext(fused_dim)
 
-        self.spectral_smoother = SpectralSmoother(
-            fused_dim, kernel_size=spectral_kernel_size, num_blocks=spectral_num_blocks
-        )
+        self.spectral_smoother = SpectralSmoother(fused_dim, kernel_size=spectral_kernel_size)
 
         self.head = nn.Sequential(
             nn.Linear(fused_dim, 64),
@@ -1388,7 +1331,6 @@ def train_spectral_model():
         "window_stride": WINDOW_STRIDE,
         "num_supervised_tail_windows": NUM_SUPERVISED_TAIL_WINDOWS,
         "spectral_smoothing_kernel_size": SPECTRAL_SMOOTHING_KERNEL_SIZE,
-        "spectral_smoothing_num_blocks": SPECTRAL_SMOOTHING_NUM_BLOCKS,
         "spectral_tv_loss_weight": SPECTRAL_TV_LOSS_WEIGHT,
         "tail_extraction": "depth_resolved_grouped_by_late_start",
         "wavelength_usage": "raw_scalar_direct",

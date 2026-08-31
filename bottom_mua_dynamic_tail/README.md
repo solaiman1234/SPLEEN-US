@@ -166,39 +166,6 @@ own per-wavelength scale, and predicts on one complete test image (all
 model's `forward` returns `(prediction, depth_profile)`; the script saves
 both.
 
-## Stacked-smoother variant
-
-A trained checkpoint's predicted-vs-true spectrum still showed the
-compressed mid-spectrum peak and long-wavelength tail undershoot from
-before spectral smoothing was added, plus residual jitter concentrated at
-the two spectral edges — consistent with a single kernel's zero-padding
-diluting the neighbor context there. Since `SpectralSmoother` can only
-reshape/blend predictions the per-wavelength backbone already computed,
-not inject information it never learned, more smoothing capacity was
-worth trying before concluding the remaining error was a training-data
-issue (see `diagnose_target_coverage.py` below for how to check that).
-
-`train_bottom_mua_spectral_smoothing_stacked.py` and its matching
-`inference_bottom_mua_spectral_smoothing_stacked.py` are copies of the
-single-block spectral-smoothing pair with one change: `SpectralSmoother`
-is split into `SpectralSmootherBlock` (one residual depthwise-separable
-conv step) and stacked `SPECTRAL_SMOOTHING_NUM_BLOCKS` times (default 2).
-Stacking widens the effective receptive field across the wavelength axis
-and gives the smoother more nonlinear capacity to correct curvature-level
-shape errors, not just local jitter. Every block is still zero-initialized,
-so the stack still starts as an exact identity function.
-
-These are separate, independently trainable files, not a drop-in
-replacement for the single-block originals: their checkpoints use a
-different `architecture` identifier
-(`bottom_mua_depth_resolved_spectral_smoothing_stacked`) and a different
-default `MODEL_PATH`/`SPECTRAL_MODEL_PATH`, so the two variants' inference
-scripts refuse to load each other's checkpoints. Keep both pairs around to
-compare whether the extra smoothing capacity actually reduces the
-compressed-peak/tail-undershoot bias, or whether (per the coverage
-diagnostic below) that bias turns out to be a training-data gap that no
-amount of smoother capacity can fix.
-
 ## Global-context variant
 
 Evaluating a checkpoint across phantoms at five different oxygenation
@@ -208,56 +175,32 @@ systematically with the phantom's oxygenation level, worst at the
 extremes. That pattern points at something `SpectralSmoother` cannot
 provide: real oxy-/deoxy-hemoglobin extinction spectra make the whole
 shape of a 169-wavelength curve informative about which regime a phantom
-is in, but a local convolution kernel (even stacked) has a bounded
-receptive field and structurally cannot let evidence at wavelength 0-20
-correct a prediction at wavelength 140-169.
+is in, but a local convolution kernel has a bounded receptive field and
+structurally cannot let evidence at wavelength 0-20 correct a prediction
+at wavelength 140-169.
 
 `train_bottom_mua_spectral_smoothing_global_context.py` and its matching
-`inference_bottom_mua_spectral_smoothing_global_context.py` add
-`GlobalSpectralContext` to the stacked-smoother pair: it pools the fused
-per-wavelength features across *all* 169 wavelengths of one image into a
-single per-image context vector (mean + max pooling), and uses it to
-apply a FiLM-style (feature-wise linear modulation) affine correction --
-`features * (1 + scale) + shift`, with `scale`/`shift` computed once per
-image and broadcast to every wavelength -- before local smoothing refines
-the result further. Like every other correction module in this codebase,
-its final layer is zero-initialized, so it starts as the identity
-transform and only begins contributing once training shows it reduces the
-loss.
+`inference_bottom_mua_spectral_smoothing_global_context.py` are copies of
+the single-block spectral-smoothing pair with one addition:
+`GlobalSpectralContext`. It pools the fused per-wavelength features
+across *all* 169 wavelengths of one image into a single per-image context
+vector (mean + max pooling), and uses it to apply a FiLM-style
+(feature-wise linear modulation) affine correction -- `features * (1 +
+scale) + shift`, with `scale`/`shift` computed once per image and
+broadcast to every wavelength -- before `SpectralSmoother`'s local
+smoothing refines the result further. Like every other correction module
+in this codebase, its final layer is zero-initialized, so it starts as
+the identity transform and only begins contributing once training shows
+it reduces the loss.
 
 This is again a separate, independently trainable file (architecture
 identifier `bottom_mua_depth_resolved_spectral_smoothing_global_context`,
 its own default `SPECTRAL_MODEL_PATH`/`MODEL_PATH`), not a drop-in
-replacement for the single-block or stacked-only variants -- keep all
-three around to compare whether global conditioning meaningfully reduces
-the oxygenation-dependent bias the stacked-only variant left behind.
-
-## Diagnosing a systematic (non-jitter) predicted-vs-true mismatch
-
-`SpectralSmoother` (and stacking more blocks into it) can only reshape or
-blend predictions the per-wavelength backbone already computed -- it
-cannot inject information the backbone never learned. If a
-predicted-vs-true spectrum plot shows a smooth, systematic mismatch (a
-compressed peak, an undershooting tail) rather than jitter, and that
-mismatch doesn't shrink as smoother capacity increases, the likely cause
-is upstream of the smoother: the training set may simply never have shown
-the backbone a phantom whose true bottom-mua reached that value at those
-wavelengths, so the model is extrapolating rather than interpolating
-there.
-
-`diagnose_target_coverage.py` checks this directly: it builds the
-per-wavelength `[min, max]` and percentile envelope of `bottom_absorption_mul`
-across every training image, and compares a given test phantom's true
-spectrum against it, flagging wavelengths where the true value falls
-outside the training distribution. If the flagged wavelength ranges line
-up with where your predicted-vs-true error is largest, the fix is more
-training-set diversity at those wavelengths/value ranges, not more model
-capacity. If the true values are well inside the training envelope and the
-model still misses them, that instead points to genuine underfitting in
-the per-wavelength backbone -- worth trying more capacity
-(`TEMPORAL_FEATURE_DIM`/`DEPTH_HIDDEN_DIM`), more training epochs, or a
-physics-informed addition such as feeding known chromophore extinction
-spectra (e.g. water/hemoglobin) as basis-function features alongside the
-raw wavelength, giving the head a much stronger prior on the expected
-spectral shape than it can infer from a limited number of training
-phantoms alone.
+replacement for `train_bottom_mua_spectral_smoothing.py` -- keep both
+around to compare whether global conditioning meaningfully reduces the
+oxygenation-dependent bias the local-only smoother leaves behind. If it
+doesn't, that would point to a training-data coverage gap (the training
+set never showing the backbone a phantom whose true bottom-mua reached a
+given value at a given wavelength) rather than an architecture limitation
+-- worth checking directly against your training set's per-wavelength
+target distribution.
