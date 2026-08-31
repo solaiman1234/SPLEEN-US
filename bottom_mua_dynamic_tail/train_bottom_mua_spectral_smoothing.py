@@ -140,6 +140,12 @@ PLATEAU_LOSS_WEIGHT = 0.05
 # Spectral-smoothing settings.
 SPECTRAL_SMOOTHING_KERNEL_SIZE = 7
 
+# More than one block widens the effective receptive field across the
+# wavelength axis and gives the smoother more nonlinear capacity to
+# correct systematic (curvature-level) spectral shape errors, not just
+# local jitter.
+SPECTRAL_SMOOTHING_NUM_BLOCKS = 2
+
 # Optional light total-variation penalty on the final predicted spectrum,
 # on top of the structural smoothing already performed by SpectralSmoother.
 # Kept off by default: too much of this can flatten genuine peaks rather
@@ -787,23 +793,19 @@ def depth_profile_auxiliary_losses(supervised_profiles, target, late_weight_powe
 # 9. SPECTRAL SMOOTHER
 # ============================================================
 
-class SpectralSmoother(nn.Module):
-    """Residual depthwise-separable smoothing across the wavelength axis.
-
-    Operates on the fused per-wavelength feature vectors of one image at a
-    time (shape [N_WAVELENGTHS, feature_dim]), giving every wavelength's
-    prediction access to a local neighborhood of the other wavelengths'
-    evidence. Zero-initialized so it starts as the identity function.
+class SpectralSmootherBlock(nn.Module):
+    """One residual depthwise-separable smoothing step across the
+    wavelength axis. Zero-initialized so it starts as the identity
+    function.
     """
 
-    def __init__(self, feature_dim, kernel_size=SPECTRAL_SMOOTHING_KERNEL_SIZE, n_wavelengths=N_WAVELENGTHS):
+    def __init__(self, feature_dim, kernel_size):
         super().__init__()
 
         if kernel_size % 2 == 0:
             raise ValueError("kernel_size must be odd for symmetric padding.")
 
         self.feature_dim = int(feature_dim)
-        self.n_wavelengths = int(n_wavelengths)
         padding = kernel_size // 2
 
         self.depthwise = nn.Conv1d(
@@ -813,11 +815,54 @@ class SpectralSmoother(nn.Module):
         self.norm = nn.GroupNorm(choose_group_count(feature_dim), feature_dim)
         self.pointwise = nn.Conv1d(feature_dim, feature_dim, kernel_size=1)
 
-        # Zero-initialized pointwise mixing: at the start of training the
-        # residual branch contributes nothing, so this module is exactly
-        # the identity until training shows the mixing helps.
+        # Zero-initialized pointwise mixing: at the start of training this
+        # block contributes nothing, so it is exactly the identity until
+        # training shows the mixing helps.
         nn.init.zeros_(self.pointwise.weight)
         nn.init.zeros_(self.pointwise.bias)
+
+    def forward(self, sequence):
+        """sequence: [n_images, feature_dim, n_wavelengths]."""
+        residual = self.pointwise(F.relu(self.norm(self.depthwise(sequence))))
+        return sequence + residual
+
+
+class SpectralSmoother(nn.Module):
+    """Stack of residual depthwise-separable smoothing blocks across the
+    wavelength axis.
+
+    Operates on the fused per-wavelength feature vectors of one image at a
+    time (shape [N_WAVELENGTHS, feature_dim]), giving every wavelength's
+    prediction access to a neighborhood of the other wavelengths' evidence
+    that widens with each additional block. Every block is zero-initialized,
+    so the whole stack starts as the identity function and can only begin
+    contributing once training shows it reduces the loss. A single block
+    can only remove local jitter; stacking blocks gives the smoother more
+    nonlinear capacity to correct systematic (curvature-level, not just
+    noise-level) shape errors across the spectrum.
+    """
+
+    def __init__(
+        self,
+        feature_dim,
+        kernel_size=SPECTRAL_SMOOTHING_KERNEL_SIZE,
+        num_blocks=SPECTRAL_SMOOTHING_NUM_BLOCKS,
+        n_wavelengths=N_WAVELENGTHS,
+    ):
+        super().__init__()
+
+        if num_blocks < 1:
+            raise ValueError("num_blocks must be at least one.")
+
+        self.feature_dim = int(feature_dim)
+        self.n_wavelengths = int(n_wavelengths)
+
+        self.blocks = nn.ModuleList(
+            [
+                SpectralSmootherBlock(feature_dim, kernel_size)
+                for _ in range(num_blocks)
+            ]
+        )
 
     def forward(self, fused_features):
         n_total, feature_dim = fused_features.shape
@@ -839,10 +884,10 @@ class SpectralSmoother(nn.Module):
         sequence = fused_features.view(n_images, self.n_wavelengths, feature_dim)
         sequence = sequence.transpose(1, 2)  # [n_images, feature_dim, n_wavelengths]
 
-        residual = self.pointwise(F.relu(self.norm(self.depthwise(sequence))))
-        mixed = sequence + residual
+        for block in self.blocks:
+            sequence = block(sequence)
 
-        mixed = mixed.transpose(1, 2).reshape(n_total, feature_dim)
+        mixed = sequence.transpose(1, 2).reshape(n_total, feature_dim)
         return mixed
 
 
@@ -889,6 +934,7 @@ class BottomMuaSpectralNet(nn.Module):
         depth_hidden_dim=DEPTH_HIDDEN_DIM,
         num_supervised_windows=NUM_SUPERVISED_TAIL_WINDOWS,
         spectral_kernel_size=SPECTRAL_SMOOTHING_KERNEL_SIZE,
+        spectral_num_blocks=SPECTRAL_SMOOTHING_NUM_BLOCKS,
     ):
         super().__init__()
 
@@ -911,7 +957,9 @@ class BottomMuaSpectralNet(nn.Module):
         # learned encoder) below.
         fused_dim = temporal_feature_dim + depth_hidden_dim + 1
 
-        self.spectral_smoother = SpectralSmoother(fused_dim, kernel_size=spectral_kernel_size)
+        self.spectral_smoother = SpectralSmoother(
+            fused_dim, kernel_size=spectral_kernel_size, num_blocks=spectral_num_blocks
+        )
 
         self.head = nn.Sequential(
             nn.Linear(fused_dim, 64),
@@ -1224,6 +1272,7 @@ def train_spectral_model():
         "window_stride": WINDOW_STRIDE,
         "num_supervised_tail_windows": NUM_SUPERVISED_TAIL_WINDOWS,
         "spectral_smoothing_kernel_size": SPECTRAL_SMOOTHING_KERNEL_SIZE,
+        "spectral_smoothing_num_blocks": SPECTRAL_SMOOTHING_NUM_BLOCKS,
         "spectral_tv_loss_weight": SPECTRAL_TV_LOSS_WEIGHT,
         "tail_extraction": "depth_resolved_grouped_by_late_start",
         "wavelength_usage": "raw_scalar_direct",

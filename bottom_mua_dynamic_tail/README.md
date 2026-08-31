@@ -136,14 +136,22 @@ and adds:
    `PerWavelengthNormalizedDataset`) — a length-169 scale vector instead of
    one dataset-wide scalar, so each wavelength is normalized against its
    own typical amplitude rather than a global one.
-2. **`SpectralSmoother`** — a residual depthwise-separable 1D convolution
-   applied across the wavelength axis, over the fused per-wavelength
-   feature vectors of one image, immediately before the regression head.
-   Every wavelength's prediction gets access to a local neighborhood
-   (`SPECTRAL_SMOOTHING_KERNEL_SIZE` wide) of the other wavelengths'
-   evidence. Its pointwise mixing weights are zero-initialized, so the
-   module starts as the identity function and can only begin contributing
-   once training shows it reduces the loss.
+2. **`SpectralSmoother`** — a stack of `SPECTRAL_SMOOTHING_NUM_BLOCKS`
+   residual depthwise-separable 1D convolution blocks (`SpectralSmootherBlock`,
+   kernel size `SPECTRAL_SMOOTHING_KERNEL_SIZE`) applied across the
+   wavelength axis, over the fused per-wavelength feature vectors of one
+   image, immediately before the regression head. Every wavelength's
+   prediction gets access to a neighborhood of the other wavelengths'
+   evidence that widens with each block. Every block's pointwise mixing
+   weights are zero-initialized, so the whole stack starts as the identity
+   function and can only begin contributing once training shows it reduces
+   the loss. A single block was tried first and mainly removed local
+   jitter but left it at the two spectral edges (where a kernel's
+   zero-padding dilutes the neighbor context) and left the compressed-peak
+   /tail-overshoot bias essentially unchanged; stacking blocks (default 2)
+   widens the effective receptive field and gives the smoother more
+   nonlinear capacity to correct that systematic, curvature-level error
+   too, not just edge-adjacent jitter.
 3. An optional, off-by-default spectral total-variation loss
    (`SPECTRAL_TV_LOSS_WEIGHT`) for experimentation — left at `0.0` because
    a hard smoothness penalty can flatten genuine peaks rather than just
