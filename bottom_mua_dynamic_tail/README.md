@@ -165,3 +165,33 @@ a learned embedding. Spectral mixing requires every wavelength of an
 image to be present together in a batch, which is automatically true here
 since each image always contributes exactly `N_WAVELENGTHS` contiguous
 rows after `flatten_image_batch`, regardless of `IMAGE_BATCH_SIZE`.
+
+## Diagnosing a systematic (non-jitter) predicted-vs-true mismatch
+
+`SpectralSmoother` (and stacking more blocks into it) can only reshape or
+blend predictions the per-wavelength backbone already computed -- it
+cannot inject information the backbone never learned. If a
+predicted-vs-true spectrum plot shows a smooth, systematic mismatch (a
+compressed peak, an undershooting tail) rather than jitter, and that
+mismatch doesn't shrink as smoother capacity increases, the likely cause
+is upstream of the smoother: the training set may simply never have shown
+the backbone a phantom whose true bottom-mua reached that value at those
+wavelengths, so the model is extrapolating rather than interpolating
+there.
+
+`diagnose_target_coverage.py` checks this directly: it builds the
+per-wavelength `[min, max]` and percentile envelope of `bottom_absorption_mul`
+across every training image, and compares a given test phantom's true
+spectrum against it, flagging wavelengths where the true value falls
+outside the training distribution. If the flagged wavelength ranges line
+up with where your predicted-vs-true error is largest, the fix is more
+training-set diversity at those wavelengths/value ranges, not more model
+capacity. If the true values are well inside the training envelope and the
+model still misses them, that instead points to genuine underfitting in
+the per-wavelength backbone -- worth trying more capacity
+(`TEMPORAL_FEATURE_DIM`/`DEPTH_HIDDEN_DIM`), more training epochs, or a
+physics-informed addition such as feeding known chromophore extinction
+spectra (e.g. water/hemoglobin) as basis-function features alongside the
+raw wavelength, giving the head a much stronger prior on the expected
+spectral shape than it can infer from a limited number of training
+phantoms alone.
