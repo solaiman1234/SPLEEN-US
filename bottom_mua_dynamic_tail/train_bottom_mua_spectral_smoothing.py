@@ -6,7 +6,7 @@ train_bottom_mua_depth_resolved.py.
 
 Each image contains:
     - 169 wavelength-specific TPSFs
-    - 300 selected time bins per TPSF
+    - N_TIME_GATES selected time bins per TPSF
     - 169 bottom_absorption_mul targets
     - 169 LATE_START indices
 
@@ -26,7 +26,7 @@ progressively later times in a DTOF have, on average, travelled deeper
 into the tissue before returning to the detector, and for late times the
 tail's log-amplitude decay slope is a direct, low-variance estimator of
 the local absorption coefficient (ln I(t) ~= -mua * v * t + const). The
-tail [LATE_START:300] is therefore not one blob of "late-time
+tail [LATE_START:N_TIME_GATES] is therefore not one blob of "late-time
 information": it is an ordered sequence of increasingly deep-sampling
 segments. DepthResolvedTailEncoder slices the tail into overlapping,
 ordered windows, extracts a windowed decay-slope feature per window, and
@@ -119,15 +119,21 @@ AMPLITUDE_JITTER_STD = 0.01
 ADDITIVE_NOISE_STD = 0.001
 MAX_TIME_SHIFT = 1
 
-# Depth-resolved tail encoder settings.
+# Depth-resolved tail encoder settings. With N_TIME_GATES=450, a tail
+# starting at LATE_START=0 produces up to ~44 windows for the GRU to
+# process (vs. ~29 when this design was sized around a 300-gate TPSF), so
+# DEPTH_HIDDEN_DIM is widened from its original 32 to give the GRU enough
+# capacity to carry that much sequential information without lossy
+# compression.
 WINDOW_BINS = 20
 WINDOW_STRIDE = 10
 DEPTH_FEATURE_DIM = 16
-DEPTH_HIDDEN_DIM = 32
+DEPTH_HIDDEN_DIM = 48
 
 # How many of the deepest windows in each tail get direct supervision
-# against the bottom-mua label.
-NUM_SUPERVISED_TAIL_WINDOWS = 3
+# against the bottom-mua label. Raised from 3 to anchor deep supervision
+# across more of what can now be a much longer window sequence.
+NUM_SUPERVISED_TAIL_WINDOWS = 5
 
 # Exponent controlling how much more the auxiliary loss weights the
 # deepest supervised window relative to the shallowest of the supervised
@@ -948,7 +954,7 @@ class BottomMuaSpectralNet(nn.Module):
             )
 
         if torch.any(starts < 0) or torch.any(starts >= N_TIME_GATES):
-            raise ValueError("LATE_START values must be within 0..299.")
+            raise ValueError(f"LATE_START values must be within 0..{N_TIME_GATES - 1}.")
 
         final_features = tpsf.new_zeros((sample_count, self.tail_hidden_dim))
         supervised_profiles = tpsf.new_zeros((sample_count, self.num_supervised_windows))
