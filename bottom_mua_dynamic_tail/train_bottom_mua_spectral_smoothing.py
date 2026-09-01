@@ -152,6 +152,18 @@ SPECTRAL_SMOOTHING_KERNEL_SIZE = 7
 # than just removing jitter.
 SPECTRAL_TV_LOSS_WEIGHT = 0.0
 
+# "raw": plain L1/MAE in physical mua units (RawMuaLoss). Treats "off by X"
+# the same regardless of whether the true value is near the low or high
+# end of the target range, so on a wide dynamic range (bottom-mua targets
+# here can span more than an order of magnitude) the optimizer can lower
+# the average absolute error mostly by fitting the numerically larger
+# targets, leaving proportionally worse accuracy at the low end.
+# "relative": mean absolute percentage error against the true value
+# (RelativeMuaLoss). Every wavelength's proportional accuracy counts
+# equally regardless of its absolute magnitude, which matters when test
+# phantoms span a wide mua range including low values.
+LOSS_MODE = "relative"
+
 
 # ============================================================
 # 2. CONFIGURATION AND REPRODUCIBILITY
@@ -1012,6 +1024,36 @@ class RawMuaLoss(nn.Module):
         return F.l1_loss(prediction, target, reduction="mean")
 
 
+class RelativeMuaLoss(nn.Module):
+    """Mean absolute percentage error against the true bottom-mua value.
+
+    Bottom-mua targets here can span more than an order of magnitude (see
+    summarize_raw_target). Plain L1/MAE in raw units treats "off by X" the
+    same regardless of whether the true value is near the low or high end
+    of that range, so the optimizer has no incentive to be proportionally
+    accurate at the low end -- it can minimize the average absolute error
+    mostly by fitting the numerically larger targets. Dividing by the true
+    value instead makes every wavelength's relative accuracy count
+    equally, independent of its absolute magnitude.
+    """
+
+    def __init__(self, eps=EPS):
+        super().__init__()
+        self.eps = float(eps)
+
+    def forward(self, prediction, target):
+        relative_error = (prediction - target).abs() / target.clamp_min(self.eps)
+        return relative_error.mean()
+
+
+def build_loss(loss_mode=LOSS_MODE):
+    if loss_mode == "raw":
+        return RawMuaLoss()
+    if loss_mode == "relative":
+        return RelativeMuaLoss()
+    raise ValueError(f"Unknown LOSS_MODE: {loss_mode!r}. Expected 'raw' or 'relative'.")
+
+
 # ============================================================
 # 12. VALIDATION
 # ============================================================
@@ -1122,7 +1164,7 @@ def train_spectral_model():
     print(f"Device: {device}")
 
     model = BottomMuaSpectralNet().to(device)
-    criterion = RawMuaLoss().to(device)
+    criterion = build_loss().to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -1213,6 +1255,7 @@ def train_spectral_model():
     checkpoint = {
         "model_state_dict": best_state,
         "architecture": "bottom_mua_depth_resolved_spectral_smoothing",
+        "loss_mode": LOSS_MODE,
         "n_wavelengths": N_WAVELENGTHS,
         "n_time_gates": N_TIME_GATES,
         "time_gate_start": TIME_GATE_START,

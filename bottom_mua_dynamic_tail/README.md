@@ -204,3 +204,62 @@ set never showing the backbone a phantom whose true bottom-mua reached a
 given value at a given wavelength) rather than an architecture limitation
 -- worth checking directly against your training set's per-wavelength
 target distribution.
+
+## Relative-error training loss
+
+Both `train_bottom_mua_spectral_smoothing.py` and
+`train_bottom_mua_spectral_smoothing_global_context.py` now expose a
+`LOSS_MODE` setting (`"raw"` or `"relative"`, default `"relative"`)
+selecting the primary regression loss via `build_loss()`:
+
+- `"raw"` (`RawMuaLoss`) -- plain L1/MAE in physical mua units, as before.
+- `"relative"` (`RelativeMuaLoss`) -- mean absolute percentage error
+  against the true value: `|prediction - target| / target`.
+
+This addresses a case where validation MAE looks good in absolute terms
+but generalization on real test phantoms is still poor: when the
+bottom-mua target range spans more than an order of magnitude (as it does
+here), plain absolute-unit L1 loss lets the optimizer minimize the average
+error mostly by fitting the numerically larger targets, leaving
+proportionally much worse accuracy at the low end of the range -- e.g. a
+fixed absolute error of ~7e-4 is a rounding error against a target of
+3e-2 but a ~26% relative error against a target of 2.7e-3. Since low-mua
+phantoms are exactly where earlier predicted-vs-true plots showed the
+largest divergence from ground truth, `RelativeMuaLoss` makes every
+wavelength's proportional accuracy count equally in the training
+objective, regardless of its absolute magnitude. Validation MAE/RMSE are
+still reported in raw physical units either way; only the optimization
+target changes. The checkpoint records which mode was used
+(`checkpoint["loss_mode"]`).
+
+Switching `LOSS_MODE` back to `"raw"` reproduces the original loss
+exactly; the two are not meant to be blended; if `"relative"` turns out to
+overcorrect (visibly worse fit at the high end of the range), that is the
+signal to try `"raw"` again or a compromise such as `nn.SmoothL1Loss` on
+log-transformed targets instead.
+
+## Improving generalization beyond the loss function
+
+If switching to `LOSS_MODE = "relative"` does not fully close the gap
+between validation error and real-test-phantom accuracy, the loss
+function was only ever addressing the "wide target range" symptom, not
+every possible cause of a train/test mismatch. Worth checking next, in
+priority order:
+
+1. **Split by phantom/source, not by file.** If `TRAIN_DIR` mixes several
+   simulated/experimental phantom families, a random 80/20 file split
+   still lets near-duplicate images from the same phantom land on both
+   sides, so validation MAE can look good even when the model has not
+   learned to generalize across phantoms. Hold out entire phantoms (or
+   entire simulation batches) for validation instead.
+2. **Check per-wavelength/per-oxygenation target coverage.** If the
+   training set's true bottom-mua values never reach the range a held-out
+   test phantom's oxygenation level produces at some wavelengths, no loss
+   function or architecture change can fix that -- it is a coverage gap,
+   not a fitting problem. Compare the training set's raw-target histogram
+   against the test phantom's per-wavelength true values directly.
+3. **Re-run the same held-out oxygenation-level test phantoms after
+   retraining** with `LOSS_MODE = "relative"` to confirm the low-mua
+   region actually improved, rather than assuming it from validation MAE
+   alone -- validation MAE is computed on the same narrow distribution as
+   training and will not surface a coverage gap.
