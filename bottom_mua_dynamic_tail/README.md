@@ -268,3 +268,48 @@ Like the other variants, this one keeps per-wavelength TPSF input
 normalization, the raw wavelength scalar (no learned embedding), and the
 `LOSS_MODE` ("raw"/"relative") choice, since none of those were
 implicated in the high training loss.
+
+## Returning to the depth-resolved variant: a tuning pass
+
+The tail-weighted variant above did not train well in practice, so
+`train_bottom_mua_spectral_smoothing.py` (GRU depth-resolved branch,
+`SpectralSmoother`, `LOSS_MODE = "relative"`) remains the primary model.
+This pass reverts the two settings that had made results worse, restores
+capacity that had been cut too far, and fixes an augmentation-wiring
+regression:
+
+1. **`NUM_SUPERVISED_TAIL_WINDOWS`: `20 -> 5`, `SPECTRAL_SMOOTHING_KERNEL_SIZE`: `11 -> 7`.**
+   Both were raised in an earlier experiment and made results worse --
+   `20` pulled 54-71% of each tail toward the single bottom-mua label
+   (see the earlier tail-window-coverage analysis), and the wider
+   smoothing kernel likely flattened genuine spectral peaks/troughs along
+   with the jitter it was meant to remove.
+2. **`TEMPORAL_FEATURE_DIM`: `32 -> 48`.** A capacity-rebalancing
+   experiment had narrowed the full-TPSF branch to widen the tail branch.
+   Both train *and* validation MAE got worse, which is the signature of
+   an actual capacity bottleneck (the full-TPSF branch still needs to
+   characterize the top layer well enough for the head to separate its
+   contribution from the bottom layer's), not overfitting. Restored.
+3. **`DEPTH_FEATURE_DIM`: `16 -> 24`.** This is the per-window embedding
+   dimension actually fed to the GRU at every step -- narrower than
+   `DEPTH_HIDDEN_DIM` (64), so it was compressing each window's 24-dim
+   raw input (20 bins + 3 slope/amplitude features + 1 depth-position
+   coordinate) more than the GRU's hidden state could make use of. A
+   wider hidden state cannot recover detail already discarded upstream,
+   so this widens the actual bottleneck rather than the buffer around it.
+4. **`TEMPORAL_DROPOUT`/`HEAD_DROPOUT`: `0.15 -> 0.10`.** With both train
+   and validation MAE elevated together (not a train/val gap), the
+   symptom points at under-capacity/over-regularization rather than
+   overfitting, so dropout was eased alongside restoring capacity above.
+5. **`USE_TRAINING_AUGMENTATION`: re-enabled, and a wiring bug fixed.**
+   A locally-edited copy of this file had reintroduced the exact
+   augmentation-wiring bug this project originally started by fixing:
+   `train_dataset` was constructed with `augment=False` hardcoded,
+   bypassing the `USE_TRAINING_AUGMENTATION` flag entirely. It is wired
+   back to `augment=USE_TRAINING_AUGMENTATION`, and the flag is set back
+   to `True` -- it is the only regularizer left once dropout was eased,
+   and was part of the originally-validated baseline.
+
+`DEPTH_HIDDEN_DIM=64` is kept at its widened value; it was never
+implicated in the regression and has independent justification (a longer
+window sequence needs a wider hidden state to avoid lossy compression).

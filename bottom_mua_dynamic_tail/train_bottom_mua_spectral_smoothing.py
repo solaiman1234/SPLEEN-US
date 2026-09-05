@@ -110,43 +110,44 @@ EPS = 1.0e-8
 TEMPORAL_FILTERS_PER_KERNEL = 12
 TEMPORAL_POOL_BINS = 4
 
-# Full-TPSF vs. depth-resolved tail feature capacity. These two are sized
-# relative to each other on purpose: diffusion theory says late-arriving
-# photons carry more direct information about the bottom-layer absorption
-# (the tail's log-amplitude decay slope is itself a direct estimator of
-# mua), while the full-TPSF branch mainly needs enough capacity to
-# characterize the top layer's contribution so the head can separate it
-# out. TEMPORAL_FEATURE_DIM is narrowed and DEPTH_HIDDEN_DIM widened
-# accordingly, keeping their sum (and therefore fused_dim, the
-# SpectralSmoother/head input width) close to its previous value so this
-# is a capacity-rebalancing experiment rather than also a model-size
-# change.
-TEMPORAL_FEATURE_DIM = 32
-TEMPORAL_DROPOUT = 0.15
+# Full-TPSF branch capacity. A prior experiment narrowed this to 32 (while
+# widening DEPTH_HIDDEN_DIM) to rebalance capacity toward the tail branch;
+# both train AND validation MAE got worse, which is the signature of a
+# genuine capacity bottleneck (the full-TPSF branch still needs enough
+# room to characterize the top layer's contribution so the head can
+# separate it from the bottom layer's), not of overfitting. Restored to
+# its original width.
+TEMPORAL_FEATURE_DIM = 48
+TEMPORAL_DROPOUT = 0.10
 
-HEAD_DROPOUT = 0.15
+HEAD_DROPOUT = 0.10
 
-USE_TRAINING_AUGMENTATION = False
+USE_TRAINING_AUGMENTATION = True
 AMPLITUDE_JITTER_STD = 0.01
 ADDITIVE_NOISE_STD = 0.001
 MAX_TIME_SHIFT = 1
 
-# Depth-resolved tail encoder settings. With N_TIME_GATES=450, a tail
-# starting at LATE_START=0 produces up to ~44 windows for the GRU to
-# process (vs. ~29 when this design was sized around a 300-gate TPSF), so
-# DEPTH_HIDDEN_DIM is widened well beyond its original 32 -- see the
-# TEMPORAL_FEATURE_DIM comment above for why it now also outweighs the
-# full-TPSF branch -- to give the GRU enough capacity to carry that much
-# sequential information without lossy compression.
+# Depth-resolved tail encoder settings. DEPTH_HIDDEN_DIM is widened beyond
+# its original 32/48 to 64 to give the GRU enough capacity to carry a long
+# window sequence (up to ~44 windows at N_TIME_GATES=450) without lossy
+# compression; this was not implicated in the regression above, so it is
+# kept. DEPTH_FEATURE_DIM -- the per-window embedding actually fed to the
+# GRU at each step -- was the narrower of the two: at 16 it compressed
+# each window's 24-dim raw input (20 bins + 3 slope/amplitude features +
+# 1 depth-position coordinate) down more than the 64-dim hidden state it
+# feeds would need, so a wider hidden state alone could not recover detail
+# already discarded upstream. Widened to relieve that bottleneck.
 WINDOW_BINS = 20
 WINDOW_STRIDE = 10
-DEPTH_FEATURE_DIM = 16
+DEPTH_FEATURE_DIM = 24
 DEPTH_HIDDEN_DIM = 64
 
 # How many of the deepest windows in each tail get direct supervision
-# against the bottom-mua label. Raised from 3 to anchor deep supervision
-# across more of what can now be a much longer window sequence.
-NUM_SUPERVISED_TAIL_WINDOWS = 20
+# against the bottom-mua label. NUM_SUPERVISED_TAIL_WINDOWS=20 pulled
+# 54-71% of each tail toward the single bottom-mua label and made results
+# worse; reverted to 5, anchoring deep supervision to just the windows
+# closest to the DTOF's final bin.
+NUM_SUPERVISED_TAIL_WINDOWS = 5
 
 # Exponent controlling how much more the auxiliary loss weights the
 # deepest supervised window relative to the shallowest of the supervised
@@ -156,8 +157,10 @@ LATE_WEIGHT_POWER = 2.0
 AUX_DEPTH_LOSS_WEIGHT = 0.3
 PLATEAU_LOSS_WEIGHT = 0.05
 
-# Spectral-smoothing settings.
-SPECTRAL_SMOOTHING_KERNEL_SIZE = 11
+# Spectral-smoothing settings. SPECTRAL_SMOOTHING_KERNEL_SIZE=11 also made
+# results worse (likely flattening genuine peaks/troughs by pooling too
+# wide a wavelength neighborhood); reverted to 7.
+SPECTRAL_SMOOTHING_KERNEL_SIZE = 7
 
 # Optional light total-variation penalty on the final predicted spectrum,
 # on top of the structural smoothing already performed by SpectralSmoother.
@@ -1281,6 +1284,7 @@ def train_spectral_model():
         "temporal_feature_dim": TEMPORAL_FEATURE_DIM,
         "temporal_dropout": TEMPORAL_DROPOUT,
         "head_dropout": HEAD_DROPOUT,
+        "depth_feature_dim": DEPTH_FEATURE_DIM,
         "depth_hidden_dim": DEPTH_HIDDEN_DIM,
         "window_bins": WINDOW_BINS,
         "window_stride": WINDOW_STRIDE,
