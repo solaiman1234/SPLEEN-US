@@ -64,7 +64,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from scipy.io import loadmat
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 
 # ============================================================
@@ -92,6 +92,47 @@ TIME_GATE_END = 450
 IMAGE_BATCH_SIZE = 4
 NUM_EPOCHS = 200
 TRAIN_FRACTION = 0.80
+
+# TRAIN_DIR mixes three data sources with a known, physically real domain
+# gap between them (different IRFs), in this file order (after
+# sorted(glob(...))):
+#   files 1..SOURCE_SIMULATED_END              -> "simulated"
+#   files SOURCE_SIMULATED_END+1..SOURCE_EXPERIMENTAL_END -> "experimental"
+#   files SOURCE_EXPERIMENTAL_END+1..end        -> "simulated_close_to_experimental"
+# A plain random 80/20 split over all files lets validation's source mix
+# fall out by chance -- with ~64% of files simulated, validation ends up
+# mostly testing simulated-data fit even though the real test set is
+# experimental phantoms. The split below instead partitions each source
+# separately, so validation always contains a deliberate share of every
+# source rather than whatever a random shuffle happens to produce.
+SOURCE_SIMULATED_END = 2300
+SOURCE_EXPERIMENTAL_END = 3573
+SOURCE_TOTAL_EXPECTED = 3615
+
+# Per-source override of the validation fraction; anything not listed
+# here uses (1 - TRAIN_FRACTION). "simulated_close_to_experimental" is
+# small (42 files) and specifically bridges the sim/experimental domain
+# gap -- holding out the usual 20% would remove ~8 of those 42 files from
+# training for comparatively little validation signal, so it defaults to
+# a smaller share. Set it to 0.0 to keep all of it in training and rely
+# entirely on the real experimental test phantoms for that source's
+# held-out check.
+SOURCE_VAL_FRACTION_OVERRIDES = {
+    "simulated_close_to_experimental": 0.10,
+}
+
+# Per-source oversampling weight for the training sampler. All 1.0 means
+# plain uniform sampling (equivalent to the previous behavior) -- left
+# neutral until the per-source validation MAE below shows whether
+# experimental accuracy actually lags simulated accuracy. If it does,
+# raising "experimental" and/or "simulated_close_to_experimental" (e.g.
+# to 2.0-3.0) oversamples them relative to their file count, which
+# currently makes up only ~36% of all training files combined.
+SOURCE_OVERSAMPLE_WEIGHTS = {
+    "simulated": 1.0,
+    "experimental": 1.0,
+    "simulated_close_to_experimental": 1.0,
+}
 
 LEARNING_RATE = 1.0e-4
 WEIGHT_DECAY = 1.0e-5
@@ -467,6 +508,117 @@ def calculate_constant_baseline(train_files, val_files):
     baseline_mae = float(np.mean(np.abs(val_values - constant_prediction)))
 
     return constant_prediction, baseline_mae
+
+
+# ============================================================
+# 4b. SOURCE-AWARE SPLIT
+# ============================================================
+
+def classify_source_by_index(file_index):
+    """Maps a position in the sorted file list to its data source, per
+    the ranges documented next to SOURCE_SIMULATED_END above.
+    """
+
+    if file_index < SOURCE_SIMULATED_END:
+        return "simulated"
+    if file_index < SOURCE_EXPERIMENTAL_END:
+        return "experimental"
+    return "simulated_close_to_experimental"
+
+
+def build_source_lookup(all_files):
+    """Returns {file_path: source_label} and prints a sanity check so you
+    can confirm the sorted file order actually matches the file-number
+    ranges the source boundaries assume, before trusting the split.
+    """
+
+    if len(all_files) != SOURCE_TOTAL_EXPECTED:
+        print(
+            f"\nWARNING: found {len(all_files)} training files but "
+            f"SOURCE_TOTAL_EXPECTED={SOURCE_TOTAL_EXPECTED}. The source "
+            f"boundaries (SOURCE_SIMULATED_END, SOURCE_EXPERIMENTAL_END) "
+            f"were set for a different file count -- update them or this "
+            f"split will misclassify files."
+        )
+
+    lookup = {
+        file_path: classify_source_by_index(index)
+        for index, file_path in enumerate(all_files)
+    }
+
+    print("\nSource boundary sanity check (confirm these filenames match")
+    print("what you expect at each source's start/end):")
+    boundary_indices = sorted({
+        0, SOURCE_SIMULATED_END - 1, SOURCE_SIMULATED_END,
+        SOURCE_EXPERIMENTAL_END - 1, SOURCE_EXPERIMENTAL_END,
+        len(all_files) - 1,
+    })
+    for index in boundary_indices:
+        if 0 <= index < len(all_files):
+            print(f"  file #{index + 1} ({classify_source_by_index(index)}): "
+                  f"{os.path.basename(all_files[index])}")
+
+    return lookup
+
+
+def stratified_train_val_split(all_files, source_lookup, train_fraction=TRAIN_FRACTION, seed=SEED):
+    """Splits each data source separately so validation always contains a
+    deliberate share of every source, instead of whatever a single random
+    shuffle across all files happens to produce.
+    """
+
+    groups = {}
+    for file_path in all_files:
+        groups.setdefault(source_lookup[file_path], []).append(file_path)
+
+    rng = random.Random(seed)
+    train_files, val_files = [], []
+
+    print("\nSource-aware train/validation split")
+    for label, files in sorted(groups.items()):
+        files = list(files)
+        rng.shuffle(files)
+
+        val_fraction = SOURCE_VAL_FRACTION_OVERRIDES.get(label, 1.0 - train_fraction)
+        n_val = int(round(val_fraction * len(files)))
+        if val_fraction > 0.0:
+            n_val = max(1, n_val)
+        n_val = min(n_val, len(files) - 1) if len(files) > 1 else 0
+
+        group_val = files[:n_val]
+        group_train = files[n_val:]
+
+        train_files.extend(group_train)
+        val_files.extend(group_val)
+
+        print(f"  {label}: {len(files)} files total -> "
+              f"{len(group_train)} train / {len(group_val)} val")
+
+    rng.shuffle(train_files)
+    rng.shuffle(val_files)
+
+    return train_files, val_files, groups
+
+
+def summarize_late_start_by_source(all_files, source_lookup):
+    """Prints LATE_START statistics separately per source. A large shift
+    between sources here is the IRF difference showing up directly in the
+    one quantity the tail-weighting/window mechanics depend on most.
+    """
+
+    by_source = {}
+    for file_path in all_files:
+        mat = loadmat(file_path)
+        values = load_late_start_indices(mat, file_path).reshape(-1)
+        by_source.setdefault(source_lookup[file_path], []).append(values)
+
+    print("\nLate-start statistics by source")
+    for label, value_list in sorted(by_source.items()):
+        values = np.concatenate(value_list)
+        print(
+            f"  {label}: min={values.min()}, median={np.median(values):.1f}, "
+            f"max={values.max()}, mean={values.mean():.2f}"
+        )
 
 
 # ============================================================
@@ -1132,12 +1284,8 @@ def train_spectral_model():
     if not all_files:
         raise FileNotFoundError(f"No training .mat files were found in:\n{TRAIN_DIR}")
 
-    split_rng = random.Random(SEED)
-    split_rng.shuffle(all_files)
-
-    split_index = int(TRAIN_FRACTION * len(all_files))
-    train_files = all_files[:split_index]
-    val_files = all_files[split_index:]
+    source_lookup = build_source_lookup(all_files)
+    train_files, val_files, _ = stratified_train_val_split(all_files, source_lookup)
 
     if not train_files or not val_files:
         raise RuntimeError("Training or validation file list is empty.")
@@ -1145,6 +1293,7 @@ def train_spectral_model():
     per_wavelength_scale = estimate_per_wavelength_input_scale(train_files)
     summarize_raw_target(train_files)
     late_start_statistics = summarize_late_start_indices(train_files)
+    summarize_late_start_by_source(all_files, source_lookup)
 
     constant_prediction, constant_baseline_mae = calculate_constant_baseline(train_files, val_files)
     print(f"\nConstant bottom-mua prediction: {constant_prediction:.6e}")
@@ -1167,14 +1316,46 @@ def train_spectral_model():
     # the batch. This is automatically satisfied here since each image
     # always contributes exactly N_WAVELENGTHS contiguous rows after
     # flatten_image_batch, regardless of IMAGE_BATCH_SIZE.
-    train_loader = DataLoader(
-        train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-    )
+    if any(weight != 1.0 for weight in SOURCE_OVERSAMPLE_WEIGHTS.values()):
+        sample_weights = [
+            SOURCE_OVERSAMPLE_WEIGHTS[source_lookup[file_path]] for file_path in train_files
+        ]
+        train_sampler = WeightedRandomSampler(
+            sample_weights, num_samples=len(train_files), replacement=True
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=IMAGE_BATCH_SIZE, sampler=train_sampler,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+        )
     val_loader = DataLoader(
         val_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
     )
+
+    # Separate per-source validation loaders purely for diagnostic
+    # reporting each epoch -- the combined val_loader above still drives
+    # the scheduler and best-checkpoint selection, so switching this on
+    # does not change what "best" means.
+    per_source_val_loaders = {}
+    for label in sorted(set(source_lookup.values())):
+        source_val_files = [f for f in val_files if source_lookup[f] == label]
+        if not source_val_files:
+            continue
+        source_val_dataset = PerWavelengthNormalizedDataset(
+            file_list=source_val_files,
+            per_wavelength_scale=per_wavelength_scale,
+            wavelength_values=raw_wavelengths,
+            augment=False,
+        )
+        per_source_val_loaders[label] = DataLoader(
+            source_val_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -1251,6 +1432,12 @@ def train_spectral_model():
             f"Val RMSE={metrics['bottom_mua_rmse']:.6e} | "
             f"LR={current_lr:.2e}"
         )
+        for label, loader in per_source_val_loaders.items():
+            source_metrics = validate_spectral(model, loader, criterion, device)
+            print(
+                f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
+                f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e}"
+            )
 
         if metrics["bottom_mua_mae"] < best_val_mae - MIN_DELTA:
             best_val_mae = metrics["bottom_mua_mae"]
@@ -1279,6 +1466,14 @@ def train_spectral_model():
         "late_start_key": LATE_START_KEY,
         "late_start_is_matlab_one_based": LATE_START_IS_MATLAB_ONE_BASED,
         "late_start_statistics": late_start_statistics,
+        "source_simulated_end": SOURCE_SIMULATED_END,
+        "source_experimental_end": SOURCE_EXPERIMENTAL_END,
+        "source_val_fraction_overrides": SOURCE_VAL_FRACTION_OVERRIDES,
+        "source_oversample_weights": SOURCE_OVERSAMPLE_WEIGHTS,
+        "source_file_counts": {
+            label: sum(1 for f in all_files if source_lookup[f] == label)
+            for label in sorted(set(source_lookup.values()))
+        },
         "temporal_filters_per_kernel": TEMPORAL_FILTERS_PER_KERNEL,
         "temporal_pool_bins": TEMPORAL_POOL_BINS,
         "temporal_feature_dim": TEMPORAL_FEATURE_DIM,

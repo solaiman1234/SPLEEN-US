@@ -313,3 +313,51 @@ regression:
 `DEPTH_HIDDEN_DIM=64` is kept at its widened value; it was never
 implicated in the regression and has independent justification (a longer
 window sequence needs a wider hidden state to avoid lossy compression).
+
+## Source-aware train/validation split
+
+`TRAIN_DIR` mixes three data sources with a real, physically-motivated
+domain gap between them (different IRFs): pure simulated data, pure
+experimental data, and a small simulated set specifically calibrated to
+be closer to the experimental data. A plain random 80/20 split over every
+file lets validation's source mix fall out by chance -- with roughly 64%
+of all files simulated, a random split's validation set ends up mostly
+testing simulated-data fit even though the real test set is three
+experimental phantoms. A validation MAE that looks good under that split
+was never lying, it just wasn't answering the question that matters for
+deployment.
+
+`build_source_lookup` and `stratified_train_val_split` replace the random
+split with one that partitions each source separately:
+
+- `SOURCE_SIMULATED_END` / `SOURCE_EXPERIMENTAL_END` mark the boundaries
+  between the three sources in the sorted file list. `build_source_lookup`
+  prints the filename at each boundary on every run specifically so you
+  can confirm the sorted order actually matches those file-number ranges
+  before trusting anything downstream -- if `TRAIN_DIR`'s file count ever
+  changes, it also prints a warning that the boundaries need updating.
+- `SOURCE_VAL_FRACTION_OVERRIDES` lets the small, precious
+  `simulated_close_to_experimental` set (42 files) use a much smaller
+  validation share (default 10%) than the other two sources (20%), so
+  holding it out for validation doesn't remove most of its value from
+  training. Set it to `0.0` to keep all of it in training and rely
+  entirely on the real experimental test phantoms for that source's
+  held-out check.
+- `SOURCE_OVERSAMPLE_WEIGHTS` optionally oversamples a source in the
+  training `DataLoader` via `WeightedRandomSampler`, for when experimental
+  and close-to-experimental data (currently ~36% of files combined) are
+  getting outweighed by the numerically larger simulated set during
+  training. Left at `1.0` for every source (no-op, identical to plain
+  shuffling) until the per-source validation breakdown below shows it's
+  needed.
+- `summarize_late_start_by_source` prints `LATE_START` statistics
+  separately per source -- a large shift between sources here is the IRF
+  difference showing up directly in the one quantity the tail-weighting
+  and window mechanics depend on most.
+- Every epoch now also prints Val MAE/RMSE separately for each source
+  (via `per_source_val_loaders`), alongside the combined Val MAE that
+  still drives the learning-rate scheduler and best-checkpoint selection
+  exactly as before. This is diagnostic first: it turns one blended
+  validation number into three, so you can see directly whether the model
+  is fitting simulated data much better than experimental before deciding
+  whether oversampling or anything architectural is actually needed.
