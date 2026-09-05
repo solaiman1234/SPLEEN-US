@@ -223,3 +223,48 @@ priority order:
    region actually improved, rather than assuming it from validation MAE
    alone -- validation MAE is computed on the same narrow distribution as
    training and will not surface a coverage gap.
+
+## Tail-weighted variant (a simpler alternative)
+
+`train_bottom_mua_tail_weighted.py` is a standalone alternative to
+`train_bottom_mua_spectral_smoothing.py`'s depth-resolved GRU branch,
+built after that design's *training* loss (not just validation loss)
+stayed high -- a sign of optimization difficulty from the architecture
+itself, not a generalization problem worth more tuning. The GRU branch
+added six interacting tail-specific hyperparameters (`WINDOW_BINS`,
+`WINDOW_STRIDE`, `NUM_SUPERVISED_TAIL_WINDOWS`, `LATE_WEIGHT_POWER`,
+`AUX_DEPTH_LOSS_WEIGHT`, `PLATEAU_LOSS_WEIGHT`) and a recurrent network to
+optimize; this variant removes all of it.
+
+Instead of a second sequence-model branch over sliced tail windows, this
+model runs a single multi-kernel convolution encoder over the *entire*
+raw TPSF (so the top-layer-dominated early part is never discarded), and
+changes only how that encoder's features are pooled into a fixed-size
+vector:
+
+- **Weighted-average pooling** with weight 1.0 for every time bin before
+  that sample's own `LATE_START`, ramping linearly up to
+  `1.0 + TAIL_WEIGHT_BOOST` at the final bin -- directly encoding "later
+  photons carry more information about the bottom-layer absorption"
+  (`ln I(t) ~= -mua * v * t + const` for late-enough `t`) as one
+  physically legible number instead of a windowed sequence model.
+- **Plain (unweighted) max pooling** alongside it, so the early peak
+  position/amplitude -- which still carries top-layer information needed
+  to separate the top layer's contribution from the bottom layer's -- is
+  not lost just because it falls outside the tail-weighted region.
+
+This collapses the previous variant's six tail-specific hyperparameters
+into one (`TAIL_WEIGHT_BOOST`, default `3.0` -- the last time bin counts
+4x as much as an early bin in the weighted average) and removes the GRU
+entirely, at the cost of not producing an inspectable per-depth profile
+the way `DepthResolvedTailEncoder` did. `SpectralSmoother` and the
+auxiliary/plateau losses are both dropped for this first pass; they can
+be layered back in once this simpler backbone is confirmed to fit the
+training set well, since a spectral smoother is a separate concern
+(cross-wavelength coherence) from the tail-weighting question this
+variant addresses.
+
+Like the other variants, this one keeps per-wavelength TPSF input
+normalization, the raw wavelength scalar (no learned embedding), and the
+`LOSS_MODE` ("raw"/"relative") choice, since none of those were
+implicated in the high training loss.
