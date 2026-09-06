@@ -61,6 +61,7 @@ calibrated for (see USE_PER_WAVELENGTH_INPUT_SCALE's comment).
 import copy
 import os
 import random
+import re
 from glob import glob
 
 import numpy as np
@@ -107,11 +108,15 @@ NUM_EPOCHS = 200
 TRAIN_FRACTION = 0.80
 
 # TRAIN_DIR mixes three data sources with a known, physically real domain
-# gap between them (different IRFs), in this file order (after
-# sorted(glob(...))):
-#   files 1..SOURCE_SIMULATED_END              -> "simulated"
-#   files SOURCE_SIMULATED_END+1..SOURCE_EXPERIMENTAL_END -> "experimental"
-#   files SOURCE_EXPERIMENTAL_END+1..end        -> "simulated_close_to_experimental"
+# gap between them (different IRFs), identified by each file's own numeric
+# index parsed from its filename (e.g. DTOF_137.mat -> 137) -- NOT by its
+# position in sorted(glob(...)), which sorts filenames as plain strings
+# ("DTOF_1.mat" < "DTOF_10.mat" < "DTOF_100.mat" < "DTOF_1000.mat" < ... <
+# "DTOF_11.mat") and so does not follow numeric order at all. See
+# extract_file_number.
+#   file numbers 1..SOURCE_SIMULATED_END                          -> "simulated"
+#   file numbers SOURCE_SIMULATED_END+1..SOURCE_EXPERIMENTAL_END   -> "experimental"
+#   file numbers SOURCE_EXPERIMENTAL_END+1..end                    -> "simulated_close_to_experimental"
 # A plain random 80/20 split over all files lets validation's source mix
 # fall out by chance -- with ~64% of files simulated, validation ends up
 # mostly testing simulated-data fit even though the real test set is
@@ -599,23 +604,52 @@ def calculate_constant_baseline(train_files, val_files):
 # 4b. SOURCE-AWARE SPLIT
 # ============================================================
 
-def classify_source_by_index(file_index):
-    """Maps a position in the sorted file list to its data source, per
-    the ranges documented next to SOURCE_SIMULATED_END above.
+FILE_NUMBER_PATTERN = re.compile(r"(\d+)(?=\.mat$)")
+
+
+def extract_file_number(file_path):
+    """Extract the integer index embedded in a filename like DTOF_137.mat.
+
+    Source classification must key off this actual number, not off
+    position in a sorted(glob(...)) list: Python's sorted() on these
+    paths sorts lexicographically as strings, so e.g. "DTOF_961.mat"
+    lands alphabetically among all the "DTOF_9xx.mat"/"DTOF_9xxx.mat"
+    names rather than next to its true numeric neighbors DTOF_960.mat and
+    DTOF_962.mat. That silently scrambles any classification based on
+    sorted-list position -- exactly what SOURCE_SIMULATED_END /
+    SOURCE_EXPERIMENTAL_END assume they can use.
     """
 
-    if file_index < SOURCE_SIMULATED_END:
+    basename = os.path.basename(file_path)
+    match = FILE_NUMBER_PATTERN.search(basename)
+    if match is None:
+        raise ValueError(
+            f"Could not find a numeric file index in filename: {basename}"
+        )
+    return int(match.group(1))
+
+
+def classify_source_by_file_number(file_number):
+    """Maps a file's own numeric index to its data source, per the ranges
+    documented next to SOURCE_SIMULATED_END above.
+    """
+
+    if file_number <= SOURCE_SIMULATED_END:
         return "simulated"
-    if file_index < SOURCE_EXPERIMENTAL_END:
+    if file_number <= SOURCE_EXPERIMENTAL_END:
         return "experimental"
     return "simulated_close_to_experimental"
 
 
 def build_source_lookup(all_files):
-    """Returns {file_path: source_label} and prints a sanity check so you
-    can confirm the sorted file order actually matches the file-number
-    ranges the source boundaries assume, before trusting the split.
+    """Returns {file_path: source_label}, classifying each file by the
+    numeric index parsed from its own filename (see extract_file_number),
+    and prints a sanity check of the file-number range actually observed
+    in each source so you can confirm it against what you expect before
+    trusting the split.
     """
+
+    file_numbers = {file_path: extract_file_number(file_path) for file_path in all_files}
 
     if len(all_files) != SOURCE_TOTAL_EXPECTED:
         print(
@@ -627,21 +661,18 @@ def build_source_lookup(all_files):
         )
 
     lookup = {
-        file_path: classify_source_by_index(index)
-        for index, file_path in enumerate(all_files)
+        file_path: classify_source_by_file_number(file_numbers[file_path])
+        for file_path in all_files
     }
 
-    print("\nSource boundary sanity check (confirm these filenames match")
-    print("what you expect at each source's start/end):")
-    boundary_indices = sorted({
-        0, SOURCE_SIMULATED_END - 1, SOURCE_SIMULATED_END,
-        SOURCE_EXPERIMENTAL_END - 1, SOURCE_EXPERIMENTAL_END,
-        len(all_files) - 1,
-    })
-    for index in boundary_indices:
-        if 0 <= index < len(all_files):
-            print(f"  file #{index + 1} ({classify_source_by_index(index)}): "
-                  f"{os.path.basename(all_files[index])}")
+    print("\nSource boundary sanity check (by each file's own parsed number,")
+    print("not sorted-list position -- confirm these ranges match what you expect):")
+    for label in ("simulated", "experimental", "simulated_close_to_experimental"):
+        numbers = sorted(file_numbers[f] for f in all_files if lookup[f] == label)
+        if numbers:
+            print(f"  {label}: {len(numbers)} files, numbers {numbers[0]} to {numbers[-1]}")
+        else:
+            print(f"  {label}: 0 files")
 
     return lookup
 

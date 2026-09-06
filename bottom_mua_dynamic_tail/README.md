@@ -508,3 +508,45 @@ to extract. Worth checking actual tail-bin magnitudes on real data before
 trusting the current value; if the tail sits near or below that noise
 floor, consider lowering it or scaling it relative to each row's own
 amplitude instead of using one fixed constant.
+
+## Critical fix: source classification was scrambled by string sorting
+
+`build_source_lookup` classified each file by its **position in
+`sorted(glob(...))`**, on the assumption that sorting the file list would
+recover numeric order (file #1 through file #3615). It does not:
+`sorted()` on filenames sorts them as plain strings, so e.g.
+`"DTOF_961.mat"` lands alphabetically among all the `"DTOF_9xx.mat"` /
+`"DTOF_9xxx.mat"` names rather than next to its true numeric neighbors
+`DTOF_960.mat` and `DTOF_962.mat`. Confirmed directly from real output:
+the file landing at sorted-position #2300 (the intended
+simulated/experimental boundary) was `DTOF_3068.mat`, and the file at
+sorted-position #3574 (the intended experimental/close-to-experimental
+boundary) was `DTOF_961.mat` -- both far from their intended numeric
+boundaries. Every source label assigned since the source-aware split was
+introduced was therefore wrong for most files.
+
+This means the per-source validation numbers reported so far (e.g. the
+epoch-92 breakdown showing `simulated_close_to_experimental` at roughly
+2x the MAE of the other two sources) were computed against these
+scrambled groups, not the real ones -- they do not reliably describe
+per-source performance. Likewise, `fine_tune_on_target_domains()` runs so
+far fine-tuned on whatever scrambled mix of files happened to carry the
+`experimental` / `simulated_close_to_experimental` labels, not the
+correct target-domain files.
+
+**Fix**: `extract_file_number()` parses each file's own numeric index
+directly out of its filename (e.g. `DTOF_137.mat` -> `137`) via regex,
+and `classify_source_by_file_number()` classifies using that number
+against `SOURCE_SIMULATED_END` / `SOURCE_EXPERIMENTAL_END` directly --
+independent of file-list order entirely. `build_source_lookup`'s sanity
+check now prints the actual file-number range observed in each source
+(instead of boundary filenames at specific sorted positions), so a
+misclassification is now visible immediately as an out-of-range number
+in the wrong bucket rather than needing to be inferred from filenames at
+arbitrary sorted positions.
+
+**Action needed**: re-run `train_spectral_model()` (and
+`fine_tune_on_target_domains()` afterward) from scratch with this fix.
+Any checkpoint or per-source validation numbers from before this fix
+should not be trusted or compared against future runs -- the underlying
+groups were different.
