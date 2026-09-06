@@ -720,3 +720,23 @@ between phase 1 and phase 2. If you have a separate inference/prediction
 script outside this file that feeds the raw wavelength value to a loaded
 checkpoint, it needs to normalize the same way before this change's
 checkpoints will predict correctly.
+
+## Larger batch size for smoother gradients
+
+`IMAGE_BATCH_SIZE` doubled `4 -> 8`. Each step previously saw only 4
+independent images (676 rows, but those rows are 4 groups of 169
+highly-correlated wavelengths, not 676 independent samples) -- a fairly
+noisy per-step gradient estimate, and part of why validation bounced so
+much before EMA was added. A larger batch also interacts with
+`SOURCE_OVERSAMPLE_WEIGHTS`: with only 4 images per step, the minority
+sources' 2x/3x upweighting doesn't reliably show up in every batch; a
+larger batch makes that representation more consistent step to step
+instead of arriving in bursts.
+
+Not a free win in general -- very large batches are empirically
+associated with converging to sharper, worse-generalizing minima unless
+compensated with other changes (LR scaling, warmup) -- but at a modest
+doubling for a ~75K-parameter model, that risk is unlikely to matter.
+Left `LEARNING_RATE` untouched to isolate this as one variable, per the
+usual practice in this file; lower `IMAGE_BATCH_SIZE` back toward 4 if
+this doesn't fit your GPU's memory.

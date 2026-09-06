@@ -107,7 +107,17 @@ N_TIME_GATES = 450
 TIME_GATE_START = 0
 TIME_GATE_END = 450
 
-IMAGE_BATCH_SIZE = 4
+# Doubled from 4: each step only saw 4 independent images (676 rows, but
+# those rows are 4 groups of 169 highly-correlated wavelengths, not 676
+# independent samples), which is a noisy per-step gradient estimate and
+# part of why validation bounced so much before EMA. A larger batch also
+# gives SOURCE_OVERSAMPLE_WEIGHTS' minority-source upweighting a better
+# chance of actually showing up within every step instead of being spread
+# thin across occasional batches. The model is small (~75K parameters)
+# and each image is a small tensor, so this is safe on essentially any
+# GPU with a few GB free -- lower it back to 4 if you hit an
+# out-of-memory error on your hardware.
+IMAGE_BATCH_SIZE = 8
 NUM_EPOCHS = 200
 TRAIN_FRACTION = 0.80
 
