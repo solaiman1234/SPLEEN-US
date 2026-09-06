@@ -278,7 +278,9 @@ LOSS_MODE = "relative"
 # ============================================================
 
 if TIME_GATE_START != 0 or TIME_GATE_END != N_TIME_GATES:
-    raise ValueError("This version must use the first 300 TPSF columns.")
+    raise ValueError(
+        f"This version must use the first {N_TIME_GATES} TPSF columns."
+    )
 
 if TEMPORAL_POOL_BINS < 1:
     raise ValueError("TEMPORAL_POOL_BINS must be at least one.")
@@ -408,8 +410,8 @@ def load_bottom_mua_target(mat, file_path):
 def load_late_start_indices(mat, file_path):
     """Load one late-start index for each of the 169 TPSFs.
 
-    Returned values are zero-based indices relative to the selected [0:300]
-    time window and have shape [169,1].
+    Returned values are zero-based indices relative to the selected
+    [0:N_TIME_GATES] time window and have shape [169,1].
     """
 
     if LATE_START_KEY not in mat:
@@ -457,7 +459,7 @@ def load_late_start_indices(mat, file_path):
             f"Converted late-start indices in '{file_path}' range from "
             f"{invalid_min} to {invalid_max}; valid Python indices are "
             f"0 to {N_TIME_GATES - 1}. Check whether your indices are "
-            f"MATLAB one-based and whether they refer to the first 300 gates."
+            f"MATLAB one-based and whether they refer to the first {N_TIME_GATES} gates."
         )
 
     return late_start.reshape(N_WAVELENGTHS, 1)
@@ -497,6 +499,19 @@ def estimate_per_wavelength_input_scale(file_list):
     print(f"Maximum: {scale.max():.6e}")
 
     return scale.reshape(N_WAVELENGTHS, 1)
+
+
+def maybe_estimate_per_wavelength_input_scale(file_list):
+    """Skips estimate_per_wavelength_input_scale's full-file-scan cost
+    when USE_PER_WAVELENGTH_INPUT_SCALE is False, since its result would
+    otherwise never be used. With thousands of training files, that scan
+    (re-reading and computing percentiles over every file) is a real
+    startup-time cost to pay for a value nothing consumes.
+    """
+
+    if not USE_PER_WAVELENGTH_INPUT_SCALE:
+        return np.ones((N_WAVELENGTHS, 1), dtype=np.float32)
+    return estimate_per_wavelength_input_scale(file_list)
 
 
 def summarize_raw_target(file_list):
@@ -805,7 +820,7 @@ def build_per_source_val_loaders(val_files, source_lookup, per_wavelength_scale,
 # ============================================================
 
 def build_raw_tpsf_channel(tpsf):
-    """Convert [N,300] raw TPSFs to [N,1,300]."""
+    """Convert [N,N_TIME_GATES] raw TPSFs to [N,1,N_TIME_GATES]."""
 
     if tpsf.ndim != 2 or tpsf.shape[1] != N_TIME_GATES:
         raise ValueError(f"Expected [N,{N_TIME_GATES}], received {tuple(tpsf.shape)}.")
@@ -1369,7 +1384,7 @@ def train_spectral_model():
     if not train_files or not val_files:
         raise RuntimeError("Training or validation file list is empty.")
 
-    per_wavelength_scale = estimate_per_wavelength_input_scale(train_files)
+    per_wavelength_scale = maybe_estimate_per_wavelength_input_scale(train_files)
     summarize_raw_target(train_files)
     late_start_statistics = summarize_late_start_indices(train_files)
     summarize_late_start_by_source(all_files, source_lookup)
@@ -1623,7 +1638,7 @@ def fine_tune_on_target_domains():
     print(f"  Fine-tune train files: {len(fine_tune_train_files)}")
     print(f"  Fine-tune val files:   {len(fine_tune_val_files)}")
 
-    per_wavelength_scale = estimate_per_wavelength_input_scale(fine_tune_train_files)
+    per_wavelength_scale = maybe_estimate_per_wavelength_input_scale(fine_tune_train_files)
 
     train_dataset = PerWavelengthNormalizedDataset(
         file_list=fine_tune_train_files,
@@ -1638,8 +1653,26 @@ def fine_tune_on_target_domains():
         augment=False,
     )
 
+    # FINE_TUNE_SOURCES are themselves wildly imbalanced (experimental
+    # outnumbers simulated_close_to_experimental roughly 30:1), which would
+    # leave the fine-tuning batches almost entirely experimental and defeat
+    # the point of specializing toward both target domains. Weight each
+    # sample by the inverse of its own source's file count so every source
+    # contributes roughly equal total mass per epoch, regardless of how
+    # many files it has.
+    fine_tune_source_counts = {}
+    for file_path in fine_tune_train_files:
+        label = source_lookup[file_path]
+        fine_tune_source_counts[label] = fine_tune_source_counts.get(label, 0) + 1
+    fine_tune_sample_weights = [
+        1.0 / fine_tune_source_counts[source_lookup[file_path]]
+        for file_path in fine_tune_train_files
+    ]
+    fine_tune_sampler = WeightedRandomSampler(
+        fine_tune_sample_weights, num_samples=len(fine_tune_train_files), replacement=True
+    )
     train_loader = DataLoader(
-        train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True,
+        train_dataset, batch_size=IMAGE_BATCH_SIZE, sampler=fine_tune_sampler,
         num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
     )
     # The combined loader above -- both FINE_TUNE_SOURCES together -- drives

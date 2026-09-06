@@ -434,3 +434,51 @@ already saved at `SPECTRAL_MODEL_PATH` instead of training a new one from
 scratch; the result is saved separately to `FINE_TUNE_MODEL_PATH`
 (`SPECTRAL_MODEL_PATH` with `_finetuned` appended), so both the general
 and fine-tuned checkpoints are kept for comparison.
+
+### Fine-tuning source imbalance fix
+
+`FINE_TUNE_SOURCES` are themselves badly imbalanced -- `experimental` has
+roughly 30x as many files as `simulated_close_to_experimental` -- so a
+plain shuffled loader over both would fill nearly every batch with
+`experimental` rows and barely touch the very source with the worst
+validation error. `fine_tune_on_target_domains()` now builds a
+`WeightedRandomSampler` for the fine-tuning train loader, weighting each
+sample by the inverse of its own source's file count so both target
+sources contribute roughly equal total mass per epoch regardless of how
+many files each has.
+
+## Code review fixes (no training-behavior change from the above)
+
+A pass over `train_bottom_mua_spectral_smoothing.py` after the fine-tuning
+and AUC-normalization changes above found two more issues, fixed
+alongside the fine-tuning sampler rebalancing:
+
+- **Wasted startup I/O**: `estimate_per_wavelength_input_scale` was still
+  called unconditionally at the start of both training and fine-tuning,
+  re-reading and scanning every training file to compute a scale that
+  `USE_PER_WAVELENGTH_INPUT_SCALE = False` throws away unused. Both call
+  sites now go through `maybe_estimate_per_wavelength_input_scale()`,
+  which returns an all-ones scale immediately when the flag is off and
+  only pays the full-scan cost when the flag is on.
+- **Stale "300 gates" references**: three leftover error messages and a
+  docstring still referred to a hardcoded `300`-time-gate design from
+  before `N_TIME_GATES` was introduced. All now reference `N_TIME_GATES`
+  so they stay correct if the crop window changes.
+
+## Visualizing training progress
+
+`plot_training_curves.py` loads a saved checkpoint and plots train vs.
+validation `bottom_mua` MAE per epoch, using the `train_bottom_mua_mae_history`
+/ `val_bottom_mua_mae_history` lists (or the `fine_tune_*` equivalents,
+auto-detected) that `train_spectral_model()` and `fine_tune_on_target_domains()`
+already save into every checkpoint. Run it locally against your own
+checkpoint file, e.g.:
+
+```
+python plot_training_curves.py --checkpoint "C:\path\to\bottom_mua_spectral_model.pth"
+```
+
+It saves a PNG next to the checkpoint (or to `--output`) and also opens an
+interactive matplotlib window on Ctrl+F5 / `python plot_training_curves.py`
+directly. It cannot be run from this session since the checkpoint file only
+exists on your machine.
