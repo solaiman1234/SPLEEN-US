@@ -15,11 +15,17 @@ For each wavelength-specific TPSF:
     raw TPSF tail -> depth-resolved sequence encoder (DepthResolvedTailEncoder)
     raw wavelength -> one direct scalar, no wavelength encoder
 
-The wavelength is concatenated into the fused feature vector as-is (the
-true physical value, not a normalized or learned-embedded one), so the
-regression head is directly supervised by each TPSF's actual wavelength
-instead of by an intermediate representation invented by a small
-sub-network trained on nothing but that one scalar.
+The wavelength is concatenated into the fused feature vector as a direct
+[0,1] min-max-normalized scalar (see load_wavelength_vector), not a
+learned embedding, so the regression head is still directly supervised by
+each TPSF's actual wavelength rather than by an intermediate
+representation invented by a small sub-network trained on nothing but
+that one scalar. Min-max normalization (rather than the raw physical
+value, e.g. ~650-950 nm) matters here because this scalar is concatenated
+with LayerNorm'd encoder outputs that sit at roughly unit scale --
+feeding in the raw value left one channel of every downstream layer
+(including SpectralSmoother's un-normalized depthwise convolution) 2-3
+orders of magnitude out of scale with the rest.
 
 Depth-resolved tail encoding: in a diffusive medium, photons collected at
 progressively later times in a DTOF have, on average, travelled deeper
@@ -792,7 +798,7 @@ def flatten_image_batch(tpsf, target=None, wavelength=None, late_start=None):
     return tpsf_flat, target_flat, wavelength_flat, late_start_flat
 
 
-def build_per_source_val_loaders(val_files, source_lookup, raw_wavelengths, labels=None):
+def build_per_source_val_loaders(val_files, source_lookup, wavelength_values, labels=None):
     """One DataLoader per data source found in val_files (or just the
     sources in `labels`, if given), for per-source diagnostic reporting.
     """
@@ -805,7 +811,7 @@ def build_per_source_val_loaders(val_files, source_lookup, raw_wavelengths, labe
             continue
         source_val_dataset = SpectralTPSFDataset(
             file_list=source_val_files,
-            wavelength_values=raw_wavelengths,
+            wavelength_values=wavelength_values,
             augment=False,
         )
         loaders[label] = DataLoader(
@@ -1447,12 +1453,12 @@ def train_spectral_model():
 
     train_dataset = SpectralTPSFDataset(
         file_list=train_files,
-        wavelength_values=raw_wavelengths,
+        wavelength_values=normalized_wavelengths,
         augment=USE_TRAINING_AUGMENTATION,
     )
     val_dataset = SpectralTPSFDataset(
         file_list=val_files,
-        wavelength_values=raw_wavelengths,
+        wavelength_values=normalized_wavelengths,
         augment=False,
     )
 
@@ -1486,7 +1492,7 @@ def train_spectral_model():
     # the scheduler and best-checkpoint selection, so switching this on
     # does not change what "best" means.
     per_source_val_loaders = build_per_source_val_loaders(
-        val_files, source_lookup, raw_wavelengths
+        val_files, source_lookup, normalized_wavelengths
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1629,7 +1635,7 @@ def train_spectral_model():
         "num_supervised_tail_windows": NUM_SUPERVISED_TAIL_WINDOWS,
         "spectral_smoothing_kernel_size": SPECTRAL_SMOOTHING_KERNEL_SIZE,
         "tail_extraction": "depth_resolved_grouped_by_late_start",
-        "wavelength_usage": "raw_scalar_direct",
+        "wavelength_usage": "normalized_0_1_scalar_direct",
         "use_ema": USE_EMA,
         "ema_decay": EMA_DECAY,
         "wavelength_file": WAVELENGTH_FILE,
@@ -1675,7 +1681,10 @@ def fine_tune_on_target_domains():
     if not os.path.isdir(TRAIN_DIR):
         raise FileNotFoundError(f"Training directory was not found:\n{TRAIN_DIR}")
 
-    raw_wavelengths, _ = load_wavelength_vector()
+    # Same normalization as train_spectral_model: load_wavelength_vector()
+    # is deterministic given the same WAVELENGTH_FILE, so this recomputes
+    # the identical [0,1] scale the base checkpoint was trained with.
+    _, normalized_wavelengths = load_wavelength_vector()
 
     wavelength_absolute_path = os.path.normcase(os.path.abspath(WAVELENGTH_FILE))
     all_files = []
@@ -1699,12 +1708,12 @@ def fine_tune_on_target_domains():
 
     train_dataset = SpectralTPSFDataset(
         file_list=fine_tune_train_files,
-        wavelength_values=raw_wavelengths,
+        wavelength_values=normalized_wavelengths,
         augment=USE_TRAINING_AUGMENTATION,
     )
     val_dataset = SpectralTPSFDataset(
         file_list=fine_tune_val_files,
-        wavelength_values=raw_wavelengths,
+        wavelength_values=normalized_wavelengths,
         augment=False,
     )
 
@@ -1740,7 +1749,7 @@ def fine_tune_on_target_domains():
     )
 
     per_source_val_loaders = build_per_source_val_loaders(
-        fine_tune_val_files, source_lookup, raw_wavelengths,
+        fine_tune_val_files, source_lookup, normalized_wavelengths,
         labels=FINE_TUNE_SOURCES,
     )
 

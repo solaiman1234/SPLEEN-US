@@ -688,3 +688,35 @@ single, too-high LR). Note that the checkpoint actually saved was never
 at risk from this climb -- `best_state` only updates on improvement -- so
 this change is about training efficiency and giving the optimizer a real
 chance at a better minimum, not about correctness of what gets saved.
+
+## Normalizing the wavelength input
+
+The wavelength scalar was being concatenated into the fused feature
+vector as its raw physical value (e.g. ~650-950 nm), while everything
+else in that vector (`full_features`, `tail_final_features`) had already
+passed through `LayerNorm` and sat at roughly unit scale. That left one
+channel of every downstream layer 2-3 orders of magnitude out of scale
+with the rest -- most consequentially for `SpectralSmoother`'s depthwise
+convolution, which has no normalization before it at all, so that
+channel's kernel had to learn an unusually tiny weight just to keep its
+contribution from dominating.
+
+`load_wavelength_vector()` already computes a `[0,1]` min-max-normalized
+version of the wavelengths (`normalized_wavelengths`) -- it just wasn't
+being used for training, only saved into the checkpoint for reference.
+Both `train_spectral_model()` and `fine_tune_on_target_domains()` now
+pass `normalized_wavelengths` into `SpectralTPSFDataset` and
+`build_per_source_val_loaders` instead of `raw_wavelengths`. This doesn't
+change the original design intent (the model is still directly supervised
+by each TPSF's actual wavelength, not a learned embedding) -- min-max
+normalization is a fixed, invertible rescaling of the same physical
+quantity, not a learned intermediate representation. `raw_wavelengths` is
+still computed and recorded in the checkpoint for reference.
+
+Since `load_wavelength_vector()` is deterministic given the same
+`WAVELENGTH_FILE`, `fine_tune_on_target_domains()` recomputes the exact
+same `[0,1]` scale the base checkpoint was trained with -- no drift
+between phase 1 and phase 2. If you have a separate inference/prediction
+script outside this file that feeds the raw wavelength value to a loaded
+checkpoint, it needs to normalize the same way before this change's
+checkpoints will predict correctly.
