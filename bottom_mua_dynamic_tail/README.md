@@ -460,25 +460,51 @@ alongside the fine-tuning sampler rebalancing:
   sites now go through `maybe_estimate_per_wavelength_input_scale()`,
   which returns an all-ones scale immediately when the flag is off and
   only pays the full-scan cost when the flag is on.
-- **Stale "300 gates" references**: three leftover error messages and a
+- **Stale "300 gates" references**: four leftover error messages and a
   docstring still referred to a hardcoded `300`-time-gate design from
-  before `N_TIME_GATES` was introduced. All now reference `N_TIME_GATES`
-  so they stay correct if the crop window changes.
+  before `N_TIME_GATES` was introduced (one more than originally found,
+  in `load_late_start_indices`'s out-of-range error message). All now
+  reference `N_TIME_GATES` so they stay correct if the crop window
+  changes.
 
 ## Visualizing training progress
 
-`plot_training_curves.py` loads a saved checkpoint and plots train vs.
-validation `bottom_mua` MAE per epoch, using the `train_bottom_mua_mae_history`
-/ `val_bottom_mua_mae_history` lists (or the `fine_tune_*` equivalents,
-auto-detected) that `train_spectral_model()` and `fine_tune_on_target_domains()`
-already save into every checkpoint. Run it locally against your own
-checkpoint file, e.g.:
+Two ways to see the train/val MAE curve:
+
+**Live, while training is running** -- `update_training_curve_plot()`
+overwrites a PNG (`TRAINING_CURVE_PATH`, next to `SPECTRAL_MODEL_PATH`;
+`FINE_TUNE_TRAINING_CURVE_PATH` during fine-tuning) after every epoch, so
+opening that file mid-run shows current progress without waiting for
+training to finish. Controlled by `PLOT_TRAINING_CURVE` (default `True`);
+requires `matplotlib` and is silently skipped (with one warning) if it
+isn't installed, so it can never crash a training run.
+
+**After the fact, from a saved checkpoint** -- `plot_training_curves.py`
+loads a checkpoint and plots the same curve from its saved
+`train_bottom_mua_mae_history` / `val_bottom_mua_mae_history` (or
+`fine_tune_*` equivalents, auto-detected):
 
 ```
 python plot_training_curves.py --checkpoint "C:\path\to\bottom_mua_spectral_model.pth"
 ```
 
-It saves a PNG next to the checkpoint (or to `--output`) and also opens an
-interactive matplotlib window on Ctrl+F5 / `python plot_training_curves.py`
-directly. It cannot be run from this session since the checkpoint file only
-exists on your machine.
+Both read the exact same history lists, so they always agree; the live
+PNG is just faster feedback during a run in progress.
+
+## A note on ADDITIVE_NOISE_STD
+
+`USE_TRAINING_AUGMENTATION` gates two active augmentations now that
+`AMPLITUDE_JITTER_STD = 0.0`: `MAX_TIME_SHIFT` (timing jitter, physically
+justified by the real IRF differences between sources) and
+`ADDITIVE_NOISE_STD` (flat per-bin Gaussian noise). The latter is worth
+checking against real data rather than assuming it's calibrated correctly:
+since the TPSF is AUC-normalized, a "typical" bin averages roughly
+`1 / N_TIME_GATES`, but the tail -- the exact region
+`DepthResolvedTailEncoder` depends on for its log-amplitude decay slope --
+decays to values well below that average. A flat `std = 0.001` applied
+everywhere can be comparable to or larger than real tail amplitudes,
+which risks swamping the physics-based signal the tail encoder is built
+to extract. Worth checking actual tail-bin magnitudes on real data before
+trusting the current value; if the tail sits near or below that noise
+floor, consider lowering it or scaling it relative to each row's own
+amplitude instead of using one fixed constant.

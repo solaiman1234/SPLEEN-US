@@ -71,6 +71,14 @@ import torch.optim as optim
 from scipy.io import loadmat
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # No GUI needed; this only ever saves a PNG to disk.
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+
 
 # ============================================================
 # 1. USER SETTINGS
@@ -159,6 +167,14 @@ FINE_TUNE_SCHEDULER_PATIENCE = 5
 # Set True and run this file to fine-tune the checkpoint already saved at
 # SPECTRAL_MODEL_PATH instead of training a new one from scratch.
 RUN_FINE_TUNING = False
+
+# Overwrites a PNG of the train/val MAE curve after every epoch, so
+# progress can be checked by opening the file while training is still
+# running rather than waiting for it to finish. Requires matplotlib;
+# silently skipped (with one warning) if it is not installed.
+PLOT_TRAINING_CURVE = True
+TRAINING_CURVE_PATH = SPECTRAL_MODEL_PATH.replace(".pth", "_training_curve.png")
+FINE_TUNE_TRAINING_CURVE_PATH = FINE_TUNE_MODEL_PATH.replace(".pth", "_training_curve.png")
 
 # The incoming TPSF is already area-under-curve normalized per wavelength
 # (each row's own integral is fixed) before it ever reaches this script.
@@ -1358,6 +1374,55 @@ def validate_spectral(model, loader, criterion, device):
 
 
 # ============================================================
+# 12b. LIVE TRAINING CURVE PLOT
+# ============================================================
+
+_warned_matplotlib_missing = False
+
+
+def update_training_curve_plot(train_history, val_history, best_epoch, output_path, title):
+    """Overwrite a PNG of train vs. val MAE so far.
+
+    Called at the end of every epoch (see train_spectral_model and
+    fine_tune_on_target_domains below), so opening output_path while
+    training is still running shows current progress -- no need to wait
+    for training to finish or reload a checkpoint afterward.
+    """
+
+    global _warned_matplotlib_missing
+
+    if not PLOT_TRAINING_CURVE:
+        return
+
+    if not MATPLOTLIB_AVAILABLE:
+        if not _warned_matplotlib_missing:
+            print("\nmatplotlib is not installed; skipping live training curve plot.")
+            _warned_matplotlib_missing = True
+        return
+
+    epochs = list(range(1, len(train_history) + 1))
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.plot(epochs, train_history, label="Train MAE", color="tab:blue")
+    ax.plot(epochs, val_history, label="Val MAE", color="tab:orange")
+
+    if best_epoch and 1 <= best_epoch <= len(epochs):
+        ax.axvline(best_epoch, color="tab:green", linestyle="--", alpha=0.6,
+                    label=f"Best epoch ({best_epoch})")
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Bottom-mua MAE (log scale)")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+# ============================================================
 # 13. TRAINING
 # ============================================================
 
@@ -1529,6 +1594,11 @@ def train_spectral_model():
             print(f"  -> Best model updated at epoch {best_epoch}.")
         else:
             epochs_without_improvement += 1
+
+        update_training_curve_plot(
+            train_mae_history, val_mae_history, best_epoch,
+            TRAINING_CURVE_PATH, "Training progress: bottom_mua MAE",
+        )
 
         if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
             print("\nEarly stopping activated.")
@@ -1787,6 +1857,11 @@ def fine_tune_on_target_domains():
             print(f"  -> Best fine-tuned model updated at epoch {best_epoch}.")
         else:
             epochs_without_improvement += 1
+
+        update_training_curve_plot(
+            train_mae_history, val_mae_history, best_epoch,
+            FINE_TUNE_TRAINING_CURVE_PATH, "Fine-tuning progress: bottom_mua MAE",
+        )
 
         if epochs_without_improvement >= FINE_TUNE_EARLY_STOPPING_PATIENCE:
             print("\nFine-tuning early stopping activated.")
