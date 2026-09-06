@@ -621,3 +621,48 @@ behavior (`eval_model` becomes `model` itself).
 
 This adds no new loss term and no architecture change -- it only changes
 *which* weights get validated and saved.
+
+## Simplification pass: removing dead and redundant code
+
+The file had accumulated several toggles that were tried, found not to
+help (or found actively harmful), and left in place as off-by-default
+switches "in case they're needed again." With none of them adding value
+and all of them adding surface area to read through, they were removed
+outright rather than just left disabled -- none of this touches the
+3-source split, per-source validation, or fine-tuning, which are kept in
+full:
+
+- **Per-wavelength input rescale** (`USE_PER_WAVELENGTH_INPUT_SCALE`,
+  `estimate_per_wavelength_input_scale`,
+  `maybe_estimate_per_wavelength_input_scale`) -- established redundant
+  once the input TPSF is already AUC-normalized per wavelength upstream,
+  and plausibly harmful to the domains it was least calibrated for.
+  `PerWavelengthNormalizedDataset` (which threaded a `per_wavelength_scale`
+  array through every dataset/loader/checkpoint call site even though it
+  was always a no-op array of ones) is renamed `SpectralTPSFDataset` and
+  no longer takes that parameter at all.
+- **Plateau variance penalty** (`PLATEAU_LOSS_WEIGHT`) -- was already
+  zeroed out as redundant with the weighted-L1 depth-supervision term;
+  now the computation itself is gone.
+  `depth_profile_auxiliary_losses` (returned an unused second value) is
+  now `depth_profile_auxiliary_loss` (returns just the one loss value
+  actually used).
+- **Spectral total-variation loss** (`SPECTRAL_TV_LOSS_WEIGHT`,
+  `spectral_total_variation_loss`) -- an experimental extra smoothing
+  penalty that was never actually turned on across this project's
+  history; `SpectralSmoother` already gives the network a structural way
+  to produce smooth spectra.
+- **Amplitude-jitter augmentation** (`AMPLITUDE_JITTER_STD`) -- not an
+  experimental toggle but a permanently-wrong augmentation for this
+  dataset: it multiplies a whole TPSF row by a random factor, which
+  breaks the fixed-integral (AUC-normalized) property this data has by
+  construction. `MAX_TIME_SHIFT` and `ADDITIVE_NOISE_STD` remain, since
+  both model real physical variation (timing jitter, measurement noise).
+
+Kept as-is, since they serve the stated goal of validating per-source and
+fine-tuning toward the test set's domains: the source-aware split
+(`build_source_lookup`, `stratified_train_val_split`), per-source
+validation reporting (`build_per_source_val_loaders`), source
+oversampling (`SOURCE_OVERSAMPLE_WEIGHTS`), `fine_tune_on_target_domains`,
+EMA, the live training-curve plot, and the core architecture
+(`TemporalEncoder`, `DepthResolvedTailEncoder`, `SpectralSmoother`).

@@ -48,14 +48,12 @@ immediately before the regression head, so every wavelength's prediction
 can pool evidence from a local neighborhood of other wavelengths instead
 of standing entirely on its own TPSF. It starts as the identity function
 and only begins contributing once training shows it reduces the loss.
-Per-wavelength TPSF input normalization (a length-169 scale vector
-instead of one dataset-wide scalar) was originally used for the same
-reason: real source/detector responses aren't uniform across wavelength.
-It is now off by default (USE_PER_WAVELENGTH_INPUT_SCALE = False) because
-the input TPSF is already area-under-curve normalized per wavelength
-before it reaches this script, which already accomplishes that; applying
-this scale again was found to plausibly hurt the domains it is least
-calibrated for (see USE_PER_WAVELENGTH_INPUT_SCALE's comment).
+A per-wavelength input rescale (dividing each wavelength's TPSF by its
+own peak amplitude) was tried for the same reason -- real source/detector
+responses aren't uniform across wavelength -- and removed: the input TPSF
+is already area-under-curve normalized per wavelength before it reaches
+this script, which already accounts for that, and the extra rescale was
+found to plausibly hurt the domains it was least calibrated for.
 """
 
 import copy
@@ -183,24 +181,6 @@ PLOT_TRAINING_CURVE = True
 TRAINING_CURVE_PATH = SPECTRAL_MODEL_PATH.replace(".pth", "_training_curve.png")
 FINE_TUNE_TRAINING_CURVE_PATH = FINE_TUNE_MODEL_PATH.replace(".pth", "_training_curve.png")
 
-# The incoming TPSF is already area-under-curve normalized per wavelength
-# (each row's own integral is fixed) before it ever reaches this script.
-# That already accomplishes estimate_per_wavelength_input_scale's stated
-# purpose -- correcting for non-uniform source/detector power across
-# wavelength -- so re-normalizing here is redundant at best. Worse,
-# estimate_per_wavelength_input_scale rescales by each wavelength's peak
-# (99th-percentile) amplitude, computed once from all training files
-# combined (~64% simulated). Once the integral is already fixed, peak
-# height is part of the physically meaningful pulse shape (a more
-# absorbing/scattering wavelength produces a broader, lower-peaked pulse
-# at the same total photon budget), and a scale estimated mostly from
-# simulated data very plausibly explains the per-source validation
-# pattern actually seen (simulated best, experimental worse, the small
-# simulated_close_to_experimental source -- the one this shared scale
-# least reflects -- more than double either). Left as a toggle rather
-# than deleted so it can still be re-tested.
-USE_PER_WAVELENGTH_INPUT_SCALE = False
-
 # A real run showed train MAE falling fast while val MAE rose above the
 # constant baseline within 2 epochs -- overfitting starting far earlier
 # than this architecture should need. LEARNING_RATE and WEIGHT_DECAY were
@@ -254,14 +234,13 @@ TEMPORAL_DROPOUT = 0.20
 HEAD_DROPOUT = 0.30
 
 USE_TRAINING_AUGMENTATION = True
-# A multiplicative amplitude factor breaks the AUC-normalization property
-# (each row's integral == a fixed constant) that the input data already
-# has by construction, training on rows whose integral is no longer
-# fixed -- a regime that never occurs in real (always-normalized) data.
-# Disabled for that reason. MAX_TIME_SHIFT and ADDITIVE_NOISE_STD are
-# unaffected by AUC normalization and still model real timing jitter and
-# measurement noise, so they are kept.
-AMPLITUDE_JITTER_STD = 0.0
+# MAX_TIME_SHIFT (timing jitter) and ADDITIVE_NOISE_STD (per-bin
+# measurement noise) model real physical variation between the sources'
+# different IRFs and detectors. A multiplicative amplitude-jitter
+# augmentation was tried too, but removed: it breaks the AUC-normalization
+# property (each row's integral == a fixed constant) the input data has
+# by construction, training on rows whose integral is no longer fixed --
+# a regime that never occurs in this real, always-normalized data.
 ADDITIVE_NOISE_STD = 0.001
 MAX_TIME_SHIFT = 1
 
@@ -293,26 +272,17 @@ NUM_SUPERVISED_TAIL_WINDOWS = 5
 LATE_WEIGHT_POWER = 2.0
 
 AUX_DEPTH_LOSS_WEIGHT = 0.3
-# The weighted-L1 term above already pulls every supervised window toward
-# the same single bottom-mua label, which already pushes those windows
-# toward agreeing with each other as a side effect -- an explicit
-# variance penalty on top of that is largely redundant, and is one more
-# term the optimizer can exploit to overfit the training tails' exact
-# shapes rather than the underlying decay-slope relationship. Removed
-# (weight 0.0) as an unnecessary block; depth_profile_auxiliary_losses
-# still computes it for anyone who wants to re-enable it.
-PLATEAU_LOSS_WEIGHT = 0.0
+# A separate variance penalty across the supervised windows (on top of the
+# weighted-L1 term above) was tried and removed: the L1 term already pulls
+# every supervised window toward the same single bottom-mua label, which
+# already pushes those windows toward agreeing with each other as a side
+# effect, so the variance penalty was redundant and just gave the
+# optimizer one more way to overfit each training tail's exact shape.
 
 # Spectral-smoothing settings. SPECTRAL_SMOOTHING_KERNEL_SIZE=11 also made
 # results worse (likely flattening genuine peaks/troughs by pooling too
 # wide a wavelength neighborhood); reverted to 7.
 SPECTRAL_SMOOTHING_KERNEL_SIZE = 7
-
-# Optional light total-variation penalty on the final predicted spectrum,
-# on top of the structural smoothing already performed by SpectralSmoother.
-# Kept off by default: too much of this can flatten genuine peaks rather
-# than just removing jitter.
-SPECTRAL_TV_LOSS_WEIGHT = 0.0
 
 # "raw": plain L1/MAE in physical mua units (RawMuaLoss). Treats "off by X"
 # the same regardless of whether the true value is near the low or high
@@ -520,53 +490,8 @@ def load_late_start_indices(mat, file_path):
 
 
 # ============================================================
-# 4. SCALE AND TARGET SUMMARY STATISTICS
+# 4. TARGET SUMMARY STATISTICS
 # ============================================================
-
-def estimate_per_wavelength_input_scale(file_list):
-    """Per-wavelength (not dataset-wide) 99th-percentile TPSF amplitude.
-
-    Returns a [N_WAVELENGTHS, 1] float32 array: the median, across
-    training images, of each wavelength's own 99th-percentile amplitude.
-    Still computed and recorded in the checkpoint for reference, but no
-    longer applied by default (see USE_PER_WAVELENGTH_INPUT_SCALE) now
-    that the input TPSF is already area-under-curve normalized per
-    wavelength upstream -- that already accounts for wavelength-dependent
-    source power / detector response, which was this function's original
-    purpose.
-    """
-
-    per_file_percentiles = []
-
-    for file_path in file_list:
-        tpsf = load_training_tpsf(loadmat(file_path), file_path)
-        percentile = np.percentile(tpsf, 99.0, axis=1)
-        per_file_percentiles.append(percentile)
-
-    stacked = np.stack(per_file_percentiles, axis=0)
-    scale = np.median(stacked, axis=0)
-    scale = np.clip(scale, EPS, None).astype(np.float32)
-
-    print("\nPer-wavelength TPSF input scale")
-    print(f"Minimum: {scale.min():.6e}")
-    print(f"Median:  {np.median(scale):.6e}")
-    print(f"Maximum: {scale.max():.6e}")
-
-    return scale.reshape(N_WAVELENGTHS, 1)
-
-
-def maybe_estimate_per_wavelength_input_scale(file_list):
-    """Skips estimate_per_wavelength_input_scale's full-file-scan cost
-    when USE_PER_WAVELENGTH_INPUT_SCALE is False, since its result would
-    otherwise never be used. With thousands of training files, that scan
-    (re-reading and computing percentiles over every file) is a real
-    startup-time cost to pay for a value nothing consumes.
-    """
-
-    if not USE_PER_WAVELENGTH_INPUT_SCALE:
-        return np.ones((N_WAVELENGTHS, 1), dtype=np.float32)
-    return estimate_per_wavelength_input_scale(file_list)
-
 
 def summarize_raw_target(file_list):
     """Print raw bottom-mua statistics. No target transform is applied."""
@@ -797,10 +722,6 @@ def augment_scaled_tpsf(tpsf, late_start):
         augmented = shift_time_axis(augmented, shift)
         adjusted_late_start = np.clip(adjusted_late_start + shift, 0, N_TIME_GATES - 1)
 
-    if AMPLITUDE_JITTER_STD > 0.0:
-        amplitude_factor = float(np.exp(np.random.normal(0.0, AMPLITUDE_JITTER_STD)))
-        augmented *= amplitude_factor
-
     if ADDITIVE_NOISE_STD > 0.0:
         noise = np.random.normal(0.0, ADDITIVE_NOISE_STD, size=augmented.shape).astype(np.float32)
         augmented += noise
@@ -809,23 +730,15 @@ def augment_scaled_tpsf(tpsf, late_start):
     return augmented, adjusted_late_start
 
 
-class PerWavelengthNormalizedDataset(Dataset):
-    """Divides each wavelength's TPSF row by its own scale instead of one
-    dataset-wide scalar.
+class SpectralTPSFDataset(Dataset):
+    """Loads one image's [N_WAVELENGTHS, N_TIME_GATES] TPSF (already
+    AUC-normalized per wavelength upstream), target, and LATE_START
+    indices, with optional augmentation.
     """
 
-    def __init__(self, file_list, per_wavelength_scale, wavelength_values, augment=False):
+    def __init__(self, file_list, wavelength_values, augment=False):
         self.file_list = list(file_list)
         self.augment = bool(augment)
-
-        per_wavelength_scale = np.asarray(per_wavelength_scale, dtype=np.float32)
-        expected_scale_shape = (N_WAVELENGTHS, 1)
-        if per_wavelength_scale.shape != expected_scale_shape:
-            raise ValueError(
-                f"per_wavelength_scale has shape {per_wavelength_scale.shape}; "
-                f"expected {expected_scale_shape}."
-            )
-        self.per_wavelength_scale = per_wavelength_scale
 
         wavelength_values = np.asarray(wavelength_values, dtype=np.float32)
         expected_wavelength_shape = (N_WAVELENGTHS, 1)
@@ -844,9 +757,6 @@ class PerWavelengthNormalizedDataset(Dataset):
         mat = loadmat(file_path)
 
         tpsf = load_training_tpsf(mat, file_path)
-        if USE_PER_WAVELENGTH_INPUT_SCALE:
-            tpsf = (tpsf / self.per_wavelength_scale).astype(np.float32)
-
         target = load_bottom_mua_target(mat, file_path)
         late_start = load_late_start_indices(mat, file_path)
 
@@ -871,7 +781,7 @@ def flatten_image_batch(tpsf, target=None, wavelength=None, late_start=None):
     return tpsf_flat, target_flat, wavelength_flat, late_start_flat
 
 
-def build_per_source_val_loaders(val_files, source_lookup, per_wavelength_scale, raw_wavelengths, labels=None):
+def build_per_source_val_loaders(val_files, source_lookup, raw_wavelengths, labels=None):
     """One DataLoader per data source found in val_files (or just the
     sources in `labels`, if given), for per-source diagnostic reporting.
     """
@@ -882,9 +792,8 @@ def build_per_source_val_loaders(val_files, source_lookup, per_wavelength_scale,
         source_val_files = [f for f in val_files if source_lookup[f] == label]
         if not source_val_files:
             continue
-        source_val_dataset = PerWavelengthNormalizedDataset(
+        source_val_dataset = SpectralTPSFDataset(
             file_list=source_val_files,
-            per_wavelength_scale=per_wavelength_scale,
             wavelength_values=raw_wavelengths,
             augment=False,
         )
@@ -1113,18 +1022,15 @@ class DepthResolvedTailEncoder(nn.Module):
         return final_feature, depth_profile
 
 
-def depth_profile_auxiliary_losses(supervised_profiles, target, late_weight_power=LATE_WEIGHT_POWER):
-    """Deep-supervision losses on the deepest windows of the depth profile.
+def depth_profile_auxiliary_loss(supervised_profiles, target, late_weight_power=LATE_WEIGHT_POWER):
+    """Deep-supervision loss on the deepest windows of the depth profile.
 
     supervised_profiles: [N, L], shallow-to-deep ordering (column -1 is the
         single deepest window).
     target: [N, 1], the bottom-mua label.
 
-    Returns (weighted_l1_loss, plateau_loss). The L1 term pulls every
-    supervised window toward the bottom-mua label, with weight increasing
-    toward the deepest window. The plateau term penalizes variance across
-    those windows, encouraging the profile to have stabilized by the time
-    it reaches the label depth.
+    Pulls every supervised window toward the bottom-mua label, with
+    weight increasing toward the deepest window.
     """
 
     n_windows = supervised_profiles.shape[1]
@@ -1136,11 +1042,7 @@ def depth_profile_auxiliary_losses(supervised_profiles, target, late_weight_powe
     weights = weights / weights.sum()
 
     error = supervised_profiles - target
-    weighted_l1 = (weights.view(1, -1) * error.abs()).sum(dim=1).mean()
-
-    plateau = supervised_profiles.var(dim=1, unbiased=False).mean()
-
-    return weighted_l1, plateau
+    return (weights.view(1, -1) * error.abs()).sum(dim=1).mean()
 
 
 # ============================================================
@@ -1204,24 +1106,6 @@ class SpectralSmoother(nn.Module):
 
         mixed = mixed.transpose(1, 2).reshape(n_total, feature_dim)
         return mixed
-
-
-def spectral_total_variation_loss(prediction, n_wavelengths=N_WAVELENGTHS):
-    """Mean absolute difference between wavelength-adjacent predictions.
-
-    Off by default (SPECTRAL_TV_LOSS_WEIGHT == 0.0): SpectralSmoother
-    already gives the network a structural way to produce smooth spectra,
-    and a strong explicit penalty here can suppress genuine peaks rather
-    than just jitter. Provided for experimentation.
-    """
-
-    n_total = prediction.shape[0]
-    if n_total % n_wavelengths != 0:
-        raise ValueError(f"Batch size {n_total} is not a multiple of {n_wavelengths}.")
-
-    n_images = n_total // n_wavelengths
-    spectrum = prediction.view(n_images, n_wavelengths)
-    return (spectrum[:, 1:] - spectrum[:, :-1]).abs().mean()
 
 
 # ============================================================
@@ -1542,7 +1426,6 @@ def train_spectral_model():
     if not train_files or not val_files:
         raise RuntimeError("Training or validation file list is empty.")
 
-    per_wavelength_scale = maybe_estimate_per_wavelength_input_scale(train_files)
     summarize_raw_target(train_files)
     late_start_statistics = summarize_late_start_indices(train_files)
     summarize_late_start_by_source(all_files, source_lookup)
@@ -1551,15 +1434,13 @@ def train_spectral_model():
     print(f"\nConstant bottom-mua prediction: {constant_prediction:.6e}")
     print(f"Constant validation MAE:         {constant_baseline_mae:.6e}")
 
-    train_dataset = PerWavelengthNormalizedDataset(
+    train_dataset = SpectralTPSFDataset(
         file_list=train_files,
-        per_wavelength_scale=per_wavelength_scale,
         wavelength_values=raw_wavelengths,
         augment=USE_TRAINING_AUGMENTATION,
     )
-    val_dataset = PerWavelengthNormalizedDataset(
+    val_dataset = SpectralTPSFDataset(
         file_list=val_files,
-        per_wavelength_scale=per_wavelength_scale,
         wavelength_values=raw_wavelengths,
         augment=False,
     )
@@ -1594,7 +1475,7 @@ def train_spectral_model():
     # the scheduler and best-checkpoint selection, so switching this on
     # does not change what "best" means.
     per_source_val_loaders = build_per_source_val_loaders(
-        val_files, source_lookup, per_wavelength_scale, raw_wavelengths
+        val_files, source_lookup, raw_wavelengths
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1643,12 +1524,9 @@ def train_spectral_model():
             prediction, supervised_profiles = model(tpsf, wavelength, late_start)
 
             primary_loss = criterion(prediction, target)
-            aux_loss, plateau_loss = depth_profile_auxiliary_losses(supervised_profiles, target)
+            aux_loss = depth_profile_auxiliary_loss(supervised_profiles, target)
 
-            loss = primary_loss + AUX_DEPTH_LOSS_WEIGHT * aux_loss + PLATEAU_LOSS_WEIGHT * plateau_loss
-
-            if SPECTRAL_TV_LOSS_WEIGHT > 0.0:
-                loss = loss + SPECTRAL_TV_LOSS_WEIGHT * spectral_total_variation_loss(prediction)
+            loss = primary_loss + AUX_DEPTH_LOSS_WEIGHT * aux_loss
 
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite training loss detected.")
@@ -1739,14 +1617,10 @@ def train_spectral_model():
         "window_stride": WINDOW_STRIDE,
         "num_supervised_tail_windows": NUM_SUPERVISED_TAIL_WINDOWS,
         "spectral_smoothing_kernel_size": SPECTRAL_SMOOTHING_KERNEL_SIZE,
-        "spectral_tv_loss_weight": SPECTRAL_TV_LOSS_WEIGHT,
         "tail_extraction": "depth_resolved_grouped_by_late_start",
         "wavelength_usage": "raw_scalar_direct",
-        "wavelength_scale_mode": "per_wavelength" if USE_PER_WAVELENGTH_INPUT_SCALE else "auc_normalized_upstream",
-        "use_per_wavelength_input_scale": USE_PER_WAVELENGTH_INPUT_SCALE,
         "use_ema": USE_EMA,
         "ema_decay": EMA_DECAY,
-        "per_wavelength_input_scale": per_wavelength_scale,
         "wavelength_file": WAVELENGTH_FILE,
         "wavelength_key": WAVELENGTH_KEY,
         "raw_wavelengths": torch.from_numpy(raw_wavelengths),
@@ -1812,17 +1686,13 @@ def fine_tune_on_target_domains():
     print(f"  Fine-tune train files: {len(fine_tune_train_files)}")
     print(f"  Fine-tune val files:   {len(fine_tune_val_files)}")
 
-    per_wavelength_scale = maybe_estimate_per_wavelength_input_scale(fine_tune_train_files)
-
-    train_dataset = PerWavelengthNormalizedDataset(
+    train_dataset = SpectralTPSFDataset(
         file_list=fine_tune_train_files,
-        per_wavelength_scale=per_wavelength_scale,
         wavelength_values=raw_wavelengths,
         augment=USE_TRAINING_AUGMENTATION,
     )
-    val_dataset = PerWavelengthNormalizedDataset(
+    val_dataset = SpectralTPSFDataset(
         file_list=fine_tune_val_files,
-        per_wavelength_scale=per_wavelength_scale,
         wavelength_values=raw_wavelengths,
         augment=False,
     )
@@ -1859,7 +1729,7 @@ def fine_tune_on_target_domains():
     )
 
     per_source_val_loaders = build_per_source_val_loaders(
-        fine_tune_val_files, source_lookup, per_wavelength_scale, raw_wavelengths,
+        fine_tune_val_files, source_lookup, raw_wavelengths,
         labels=FINE_TUNE_SOURCES,
     )
 
@@ -1914,12 +1784,9 @@ def fine_tune_on_target_domains():
             prediction, supervised_profiles = model(tpsf, wavelength, late_start)
 
             primary_loss = criterion(prediction, target)
-            aux_loss, plateau_loss = depth_profile_auxiliary_losses(supervised_profiles, target)
+            aux_loss = depth_profile_auxiliary_loss(supervised_profiles, target)
 
-            loss = primary_loss + AUX_DEPTH_LOSS_WEIGHT * aux_loss + PLATEAU_LOSS_WEIGHT * plateau_loss
-
-            if SPECTRAL_TV_LOSS_WEIGHT > 0.0:
-                loss = loss + SPECTRAL_TV_LOSS_WEIGHT * spectral_total_variation_loss(prediction)
+            loss = primary_loss + AUX_DEPTH_LOSS_WEIGHT * aux_loss
 
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite fine-tuning loss detected.")
@@ -1987,7 +1854,6 @@ def fine_tune_on_target_domains():
         "fine_tune_sources": FINE_TUNE_SOURCES,
         "fine_tune_learning_rate": FINE_TUNE_LEARNING_RATE,
         "fine_tune_base_checkpoint": SPECTRAL_MODEL_PATH,
-        "fine_tune_per_wavelength_input_scale": per_wavelength_scale,
         "fine_tune_best_epoch": best_epoch,
         "fine_tune_best_validation_bottom_mua_mae": best_val_mae,
         "fine_tune_train_bottom_mua_mae_history": train_mae_history,
