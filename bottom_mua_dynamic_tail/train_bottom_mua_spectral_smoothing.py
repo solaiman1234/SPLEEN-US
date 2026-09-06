@@ -210,6 +210,19 @@ USE_PER_WAVELENGTH_INPUT_SCALE = False
 LEARNING_RATE = 5.0e-5
 WEIGHT_DECAY = 1.0e-4
 
+# A real run after the anti-overfitting pass above showed train MAE
+# falling smoothly to ~1e-3 while val MAE oscillated between roughly
+# 2.5e-3 and 5.8e-3 for the entire run, with only one lucky epoch (out of
+# 55) landing meaningfully below the constant baseline -- not runaway
+# overfitting anymore, but the weights are still bouncing around a
+# decent solution rather than settling into one, so picking "the epoch
+# with the lowest val MAE" is largely picking a noise draw. An
+# exponential moving average of the weights, evaluated and checkpointed
+# instead of the raw in-training weights, averages that noise out
+# without adding any new loss term or architecture.
+USE_EMA = True
+EMA_DECAY = 0.999
+
 NUM_WORKERS = 0
 PIN_MEMORY = torch.cuda.is_available()
 
@@ -1474,6 +1487,35 @@ def update_training_curve_plot(train_history, val_history, best_epoch, output_pa
 
 
 # ============================================================
+# 12c. EXPONENTIAL MOVING AVERAGE OF WEIGHTS
+# ============================================================
+
+def create_ema_model(model):
+    """A frozen, eval-mode copy of model to hold the running weight
+    average. See USE_EMA's comment above for why this exists.
+    """
+
+    ema_model = copy.deepcopy(model)
+    ema_model.eval()
+    for param in ema_model.parameters():
+        param.requires_grad_(False)
+    return ema_model
+
+
+@torch.no_grad()
+def update_ema_model(ema_model, model, decay=EMA_DECAY):
+    """Called once per optimizer step: ema_weight <- decay*ema_weight +
+    (1-decay)*current_weight. Buffers (e.g. GroupNorm running stats, if
+    any existed) are copied directly rather than averaged.
+    """
+
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+    for ema_buffer, buffer in zip(ema_model.buffers(), model.buffers()):
+        ema_buffer.copy_(buffer)
+
+
+# ============================================================
 # 13. TRAINING
 # ============================================================
 
@@ -1561,6 +1603,12 @@ def train_spectral_model():
     model = BottomMuaSpectralNet().to(device)
     criterion = build_loss().to(device)
 
+    # eval_model is what gets validated and checkpointed. With USE_EMA it
+    # is a separately-tracked running average of model's weights (see
+    # USE_EMA's comment); with USE_EMA off it is just model itself, so
+    # disabling the flag reproduces the exact prior behavior.
+    eval_model = create_ema_model(model) if USE_EMA else model
+
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=SCHEDULER_PATIENCE, min_lr=1.0e-7
@@ -1609,13 +1657,16 @@ def train_spectral_model():
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIP_NORM)
             optimizer.step()
 
+            if USE_EMA:
+                update_ema_model(eval_model, model)
+
             raw_error = prediction.detach() - target
             count = raw_error.numel()
             absolute_error_sum += torch.abs(raw_error).sum().item()
             sample_count += count
 
         train_mae = absolute_error_sum / sample_count
-        metrics = validate_spectral(model, val_loader, criterion, device)
+        metrics = validate_spectral(eval_model, val_loader, criterion, device)
 
         scheduler.step(metrics["bottom_mua_mae"])
         current_lr = optimizer.param_groups[0]["lr"]
@@ -1631,7 +1682,7 @@ def train_spectral_model():
             f"LR={current_lr:.2e}"
         )
         for label, loader in per_source_val_loaders.items():
-            source_metrics = validate_spectral(model, loader, criterion, device)
+            source_metrics = validate_spectral(eval_model, loader, criterion, device)
             print(
                 f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
                 f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e}"
@@ -1641,7 +1692,7 @@ def train_spectral_model():
             best_val_mae = metrics["bottom_mua_mae"]
             best_epoch = epoch + 1
             epochs_without_improvement = 0
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = copy.deepcopy(eval_model.state_dict())
             print(f"  -> Best model updated at epoch {best_epoch}.")
         else:
             epochs_without_improvement += 1
@@ -1693,6 +1744,8 @@ def train_spectral_model():
         "wavelength_usage": "raw_scalar_direct",
         "wavelength_scale_mode": "per_wavelength" if USE_PER_WAVELENGTH_INPUT_SCALE else "auc_normalized_upstream",
         "use_per_wavelength_input_scale": USE_PER_WAVELENGTH_INPUT_SCALE,
+        "use_ema": USE_EMA,
+        "ema_decay": EMA_DECAY,
         "per_wavelength_input_scale": per_wavelength_scale,
         "wavelength_file": WAVELENGTH_FILE,
         "wavelength_key": WAVELENGTH_KEY,
@@ -1822,6 +1875,9 @@ def fine_tune_on_target_domains():
         f"(validation MAE {base_checkpoint.get('best_validation_bottom_mua_mae', float('nan')):.6e})."
     )
 
+    # See USE_EMA's comment above train_spectral_model's identical setup.
+    eval_model = create_ema_model(model) if USE_EMA else model
+
     criterion = build_loss().to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=FINE_TUNE_LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -1872,13 +1928,16 @@ def fine_tune_on_target_domains():
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIP_NORM)
             optimizer.step()
 
+            if USE_EMA:
+                update_ema_model(eval_model, model)
+
             raw_error = prediction.detach() - target
             count = raw_error.numel()
             absolute_error_sum += torch.abs(raw_error).sum().item()
             sample_count += count
 
         train_mae = absolute_error_sum / sample_count
-        metrics = validate_spectral(model, val_loader, criterion, device)
+        metrics = validate_spectral(eval_model, val_loader, criterion, device)
 
         scheduler.step(metrics["bottom_mua_mae"])
         current_lr = optimizer.param_groups[0]["lr"]
@@ -1894,7 +1953,7 @@ def fine_tune_on_target_domains():
             f"LR={current_lr:.2e}"
         )
         for label, loader in per_source_val_loaders.items():
-            source_metrics = validate_spectral(model, loader, criterion, device)
+            source_metrics = validate_spectral(eval_model, loader, criterion, device)
             print(
                 f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
                 f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e}"
@@ -1904,7 +1963,7 @@ def fine_tune_on_target_domains():
             best_val_mae = metrics["bottom_mua_mae"]
             best_epoch = epoch + 1
             epochs_without_improvement = 0
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = copy.deepcopy(eval_model.state_dict())
             print(f"  -> Best fine-tuned model updated at epoch {best_epoch}.")
         else:
             epochs_without_improvement += 1

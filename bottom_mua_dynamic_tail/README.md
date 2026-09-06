@@ -591,3 +591,33 @@ above -- val MAE should track train MAE much more closely for longer
 before diverging, and the `experimental`/`simulated_close_to_experimental`
 per-source numbers should stop blowing up disproportionately to
 `simulated`.
+
+## Exponential moving average of weights (EMA)
+
+A real run with the anti-overfitting pass above showed the runaway
+divergence was fixed, but the resulting curve wasn't healthy either: train
+MAE fell smoothly to ~1e-3 over 55 epochs while val MAE oscillated between
+roughly 2.5e-3 and 5.8e-3 for the *entire* run, with only one epoch (36,
+out of 55) landing meaningfully below the constant baseline. That's not
+overfitting -- it's optimization noise: the weights are still bouncing
+around a decent solution rather than settling into one, so "the epoch
+with the lowest val MAE" is largely a lucky noise draw rather than a
+reliable checkpoint to keep.
+
+`USE_EMA` (default `True`) tracks a separate, frozen copy of the model's
+weights (`eval_model`) that gets updated after every optimizer step as
+`ema_weight <- EMA_DECAY*ema_weight + (1-EMA_DECAY)*current_weight`
+(`create_ema_model` / `update_ema_model`, section 12c). Validation, the
+scheduler, and best-checkpoint selection all use `eval_model` instead of
+the raw in-training `model`, so the saved checkpoint is a smoothed average
+over recent steps rather than one single noisy snapshot. `EMA_DECAY =
+0.999` gives an averaging half-life of roughly 700 steps -- about one
+epoch at this dataset's size -- long enough to smooth out the observed
+epoch-to-epoch swings without lagging so far behind that it can't track
+real, sustained improvement. `fine_tune_on_target_domains()` mirrors the
+same setup, seeding its own `eval_model` from the loaded (already-EMA)
+checkpoint. Setting `USE_EMA = False` reproduces the exact prior
+behavior (`eval_model` becomes `model` itself).
+
+This adds no new loss term and no architecture change -- it only changes
+*which* weights get validated and saved.
