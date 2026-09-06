@@ -722,6 +722,31 @@ def summarize_late_start_by_source(all_files, source_lookup):
         )
 
 
+def summarize_raw_target_by_source(all_files, source_lookup):
+    """Prints bottom-mua target statistics separately per source.
+
+    Raw per-source validation MAE (printed each epoch) is an absolute
+    error in physical mua units. If one source's targets simply sit at a
+    smaller absolute magnitude than another's, its raw MAE will read
+    lower even at the same *relative* accuracy -- this print lets you
+    check that directly instead of assuming "lower raw MAE" means "more
+    accurate" when comparing across sources.
+    """
+
+    by_source = {}
+    for file_path in all_files:
+        target = load_bottom_mua_target(loadmat(file_path), file_path).reshape(-1)
+        by_source.setdefault(source_lookup[file_path], []).append(target)
+
+    print("\nBottom-mua raw target statistics by source")
+    for label, value_list in sorted(by_source.items()):
+        values = np.concatenate(value_list)
+        print(
+            f"  {label}: min={values.min():.6e}, median={np.median(values):.6e}, "
+            f"max={values.max():.6e}, mean={values.mean():.6e}"
+        )
+
+
 # ============================================================
 # 5. DATASET
 # ============================================================
@@ -1313,11 +1338,21 @@ def build_loss(loss_mode=LOSS_MODE):
 
 @torch.no_grad()
 def validate_spectral(model, loader, criterion, device):
+    """Note on comparing bottom_mua_mae across sources: it is an absolute
+    error in raw physical mua units, so a lower value for one source does
+    not by itself mean the model is more accurate there -- it could just
+    mean that source's targets sit at a smaller absolute magnitude (see
+    summarize_raw_target_by_source). bottom_mua_relative_mae (mean
+    |error|/target, matching RelativeMuaLoss) is scale-independent and is
+    the fairer number for cross-source comparisons.
+    """
+
     model.eval()
 
     loss_sum = 0.0
     absolute_error_sum = 0.0
     squared_error_sum = 0.0
+    relative_error_sum = 0.0
     value_count = 0
 
     for tpsf, target, wavelength, late_start in loader:
@@ -1339,12 +1374,14 @@ def validate_spectral(model, loader, criterion, device):
         loss_sum += loss.item() * count
         absolute_error_sum += torch.abs(error).sum().item()
         squared_error_sum += torch.square(error).sum().item()
+        relative_error_sum += (torch.abs(error) / target.clamp_min(EPS)).sum().item()
         value_count += count
 
     return {
         "raw_loss": loss_sum / value_count,
         "bottom_mua_mae": absolute_error_sum / value_count,
         "bottom_mua_rmse": np.sqrt(squared_error_sum / value_count),
+        "bottom_mua_relative_mae": relative_error_sum / value_count,
     }
 
 
@@ -1454,6 +1491,7 @@ def train_spectral_model():
         raise RuntimeError("Training or validation file list is empty.")
 
     summarize_raw_target(train_files)
+    summarize_raw_target_by_source(all_files, source_lookup)
     late_start_statistics = summarize_late_start_indices(train_files)
     summarize_late_start_by_source(all_files, source_lookup)
 
@@ -1584,13 +1622,19 @@ def train_spectral_model():
             f"Train MAE={train_mae:.6e} | "
             f"Val MAE={metrics['bottom_mua_mae']:.6e} | "
             f"Val RMSE={metrics['bottom_mua_rmse']:.6e} | "
+            f"Val RelMAE={metrics['bottom_mua_relative_mae'] * 100:.2f}% | "
             f"LR={current_lr:.2e}"
         )
+        # RelMAE (mean |error|/target) is scale-independent, unlike raw
+        # MAE/RMSE -- use it, not raw MAE, to compare accuracy across
+        # sources whose target magnitudes may differ (see
+        # summarize_raw_target_by_source and validate_spectral's docstring).
         for label, loader in per_source_val_loaders.items():
             source_metrics = validate_spectral(eval_model, loader, criterion, device)
             print(
                 f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
-                f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e}"
+                f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e} | "
+                f"Val RelMAE={source_metrics['bottom_mua_relative_mae'] * 100:.2f}%"
             )
 
         if metrics["bottom_mua_mae"] < best_val_mae - MIN_DELTA:
@@ -1847,13 +1891,15 @@ def fine_tune_on_target_domains():
             f"Train MAE={train_mae:.6e} | "
             f"Val MAE={metrics['bottom_mua_mae']:.6e} | "
             f"Val RMSE={metrics['bottom_mua_rmse']:.6e} | "
+            f"Val RelMAE={metrics['bottom_mua_relative_mae'] * 100:.2f}% | "
             f"LR={current_lr:.2e}"
         )
         for label, loader in per_source_val_loaders.items():
             source_metrics = validate_spectral(eval_model, loader, criterion, device)
             print(
                 f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
-                f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e}"
+                f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e} | "
+                f"Val RelMAE={source_metrics['bottom_mua_relative_mae'] * 100:.2f}%"
             )
 
         if metrics["bottom_mua_mae"] < best_val_mae - MIN_DELTA:

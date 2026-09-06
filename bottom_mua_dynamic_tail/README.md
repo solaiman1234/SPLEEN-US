@@ -740,3 +740,30 @@ doubling for a ~75K-parameter model, that risk is unlikely to matter.
 Left `LEARNING_RATE` untouched to isolate this as one variable, per the
 usual practice in this file; lower `IMAGE_BATCH_SIZE` back toward 4 if
 this doesn't fit your GPU's memory.
+
+## Per-source raw MAE isn't a fair cross-source comparison by itself
+
+A run showed `experimental`'s raw validation MAE lower than `simulated`'s
+-- easy to read as "the model does better on experimental," but
+`bottom_mua_mae` is an *absolute* error in raw physical mua units. If
+`experimental`'s target values simply sit at a smaller absolute magnitude
+than `simulated`'s wider synthetic sweep, a lower raw MAE there doesn't
+mean better *proportional* accuracy -- it can just reflect smaller
+targets. Since bottom-mua targets are known to span more than an order of
+magnitude (the whole reason `RelativeMuaLoss` exists), this ambiguity is
+real, not hypothetical, and the code had no way to tell the two apart.
+
+Two additions close that gap:
+
+- **`summarize_raw_target_by_source()`** -- prints each source's target
+  min/median/max/mean once at the start of training, so you can directly
+  check whether `experimental`'s targets are just numerically smaller.
+- **`validate_spectral()`** now also returns `bottom_mua_relative_mae`
+  (mean `|error|/target`, the same quantity `RelativeMuaLoss` computes) --
+  scale-independent, so it's the fair number for comparing accuracy
+  *across* sources with potentially different target magnitudes. Printed
+  as `Val RelMAE=...%` alongside the existing raw `Val MAE`/`Val RMSE` in
+  both the combined and per-source lines, in both `train_spectral_model()`
+  and `fine_tune_on_target_domains()`. The combined `val_loader`'s raw MAE
+  still drives the scheduler and best-checkpoint selection, unchanged --
+  RelMAE is diagnostic, matching the existing per-source reporting's role.
