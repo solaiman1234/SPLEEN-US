@@ -1345,6 +1345,14 @@ def validate_spectral(model, loader, criterion, device):
     summarize_raw_target_by_source). bottom_mua_relative_mae (mean
     |error|/target, matching RelativeMuaLoss) is scale-independent and is
     the fairer number for cross-source comparisons.
+
+    bottom_mua_bias is the mean SIGNED error (prediction - target, not
+    absolute), and bottom_mua_relative_bias is the same divided by target.
+    MAE/RMSE/RelMAE all average |error|, which erases the sign -- a model
+    that is consistently biased in one direction and one that is unbiased
+    but noisy can show the same MAE. Bias is the number that actually
+    tells them apart, e.g. to check whether fine-tuning corrected a
+    systematic over/under-prediction rather than just changed the scatter.
     """
 
     model.eval()
@@ -1353,6 +1361,8 @@ def validate_spectral(model, loader, criterion, device):
     absolute_error_sum = 0.0
     squared_error_sum = 0.0
     relative_error_sum = 0.0
+    signed_error_sum = 0.0
+    signed_relative_error_sum = 0.0
     value_count = 0
 
     for tpsf, target, wavelength, late_start in loader:
@@ -1375,6 +1385,8 @@ def validate_spectral(model, loader, criterion, device):
         absolute_error_sum += torch.abs(error).sum().item()
         squared_error_sum += torch.square(error).sum().item()
         relative_error_sum += (torch.abs(error) / target.clamp_min(EPS)).sum().item()
+        signed_error_sum += error.sum().item()
+        signed_relative_error_sum += (error / target.clamp_min(EPS)).sum().item()
         value_count += count
 
     return {
@@ -1382,6 +1394,8 @@ def validate_spectral(model, loader, criterion, device):
         "bottom_mua_mae": absolute_error_sum / value_count,
         "bottom_mua_rmse": np.sqrt(squared_error_sum / value_count),
         "bottom_mua_relative_mae": relative_error_sum / value_count,
+        "bottom_mua_bias": signed_error_sum / value_count,
+        "bottom_mua_relative_bias": signed_relative_error_sum / value_count,
     }
 
 
@@ -1563,6 +1577,7 @@ def train_spectral_model():
     best_val_mae = float("inf")
     best_epoch = 0
     best_state = None
+    best_epoch_learning_rate = None
     epochs_without_improvement = 0
 
     train_mae_history = []
@@ -1634,12 +1649,14 @@ def train_spectral_model():
             print(
                 f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
                 f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e} | "
-                f"Val RelMAE={source_metrics['bottom_mua_relative_mae'] * 100:.2f}%"
+                f"Val RelMAE={source_metrics['bottom_mua_relative_mae'] * 100:.2f}% | "
+                f"Val RelBias={source_metrics['bottom_mua_relative_bias'] * 100:+.2f}%"
             )
 
         if metrics["bottom_mua_mae"] < best_val_mae - MIN_DELTA:
             best_val_mae = metrics["bottom_mua_mae"]
             best_epoch = epoch + 1
+            best_epoch_learning_rate = current_lr
             epochs_without_improvement = 0
             best_state = copy.deepcopy(eval_model.state_dict())
             print(f"  -> Best model updated at epoch {best_epoch}.")
@@ -1698,6 +1715,7 @@ def train_spectral_model():
         "normalized_wavelengths": torch.from_numpy(normalized_wavelengths),
         "best_epoch": best_epoch,
         "best_validation_bottom_mua_mae": best_val_mae,
+        "best_epoch_learning_rate": best_epoch_learning_rate,
         "constant_validation_bottom_mua_mae": constant_baseline_mae,
         "train_bottom_mua_mae_history": train_mae_history,
         "val_bottom_mua_mae_history": val_mae_history,
@@ -1819,6 +1837,26 @@ def fine_tune_on_target_domains():
         f"(validation MAE {base_checkpoint.get('best_validation_bottom_mua_mae', float('nan')):.6e})."
     )
 
+    # fine_tune_on_target_domains() always starts a brand-new optimizer at
+    # FINE_TUNE_LEARNING_RATE -- it does not read or inherit whatever LR
+    # the main run's ReduceLROnPlateau schedule had decayed to by the time
+    # it stopped. The whole point of fine-tuning at "a much lower learning
+    # rate" is to nudge the base checkpoint's weights gently rather than
+    # overwrite them; if the base run's LR had already decayed below
+    # FINE_TUNE_LEARNING_RATE before it stopped, fine-tuning would actually
+    # take BIGGER steps than the base model had converged with, working
+    # against that goal. Warn if that's the case so it isn't silent.
+    base_epoch_lr = base_checkpoint.get("best_epoch_learning_rate")
+    if base_epoch_lr is not None and FINE_TUNE_LEARNING_RATE >= base_epoch_lr:
+        print(
+            f"\nWARNING: FINE_TUNE_LEARNING_RATE ({FINE_TUNE_LEARNING_RATE:.2e}) is not "
+            f"lower than the LR the base checkpoint's best epoch was actually trained "
+            f"at ({base_epoch_lr:.2e}). Fine-tuning would take steps at least as large "
+            f"as what training had already converged to, rather than gently "
+            f"specializing it -- consider lowering FINE_TUNE_LEARNING_RATE below "
+            f"{base_epoch_lr:.2e}."
+        )
+
     # See USE_EMA's comment above train_spectral_model's identical setup.
     eval_model = create_ema_model(model) if USE_EMA else model
 
@@ -1899,7 +1937,8 @@ def fine_tune_on_target_domains():
             print(
                 f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
                 f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e} | "
-                f"Val RelMAE={source_metrics['bottom_mua_relative_mae'] * 100:.2f}%"
+                f"Val RelMAE={source_metrics['bottom_mua_relative_mae'] * 100:.2f}% | "
+                f"Val RelBias={source_metrics['bottom_mua_relative_bias'] * 100:+.2f}%"
             )
 
         if metrics["bottom_mua_mae"] < best_val_mae - MIN_DELTA:

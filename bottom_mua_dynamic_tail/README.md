@@ -767,3 +767,48 @@ Two additions close that gap:
   and `fine_tune_on_target_domains()`. The combined `val_loader`'s raw MAE
   still drives the scheduler and best-checkpoint selection, unchanged --
   RelMAE is diagnostic, matching the existing per-source reporting's role.
+
+## Measuring bias, not just error magnitude
+
+MAE/RMSE/RelMAE all average `|error|`, which erases the sign -- a model
+that is consistently biased in one direction (always over- or
+under-predicting) and one that is unbiased but noisy can show the exact
+same MAE. That distinction matters directly for fine-tuning: the reason
+to expect fine-tuning to help is that a systematic domain bias (e.g. from
+`experimental`/`simulated_close_to_experimental` being underrepresented
+during general training) is a structured, one-directional error that
+gradient descent corrects efficiently, unlike random scatter. There was
+no way to check that empirically, since nothing measured sign.
+
+`validate_spectral()` now also returns `bottom_mua_bias` (mean signed
+`prediction - target`) and `bottom_mua_relative_bias` (the same divided
+by target, matching `RelativeMuaLoss`'s scale). Printed as
+`Val RelBias=+/-...%` in the per-source lines (both `train_spectral_model()`
+and `fine_tune_on_target_domains()`) -- a large `|RelBias|` alongside a
+similar RelMAE points to a systematic, correctable bias rather than noise;
+comparing it between the general checkpoint and the fine-tuned one on the
+same source directly shows whether fine-tuning actually reduced that bias
+rather than just moved the scatter around.
+
+## Fine-tuning always starts a fresh optimizer -- LR mismatch check
+
+`fine_tune_on_target_domains()` creates a brand-new `AdamW` optimizer at a
+fixed `FINE_TUNE_LEARNING_RATE` -- it never reads or inherits whatever LR
+the main run's `ReduceLROnPlateau` schedule had decayed to by the time it
+stopped. With `SCHEDULER_PATIENCE=3` and `EARLY_STOPPING_PATIENCE=12`, the
+main run can go through up to 4 LR halvings before stopping (`5e-5 ->
+2.5e-5 -> 1.25e-5 -> 6.25e-6 -> 3.1e-6`), so it's entirely plausible its
+LR ends up *below* `FINE_TUNE_LEARNING_RATE = 1e-5` by the time it stops.
+If that happens, fine-tuning would take **bigger** steps than the base
+model had already converged with -- the opposite of "a much lower
+learning rate so the general representation isn't overwritten," and the
+two phases had no way to notice this mismatch.
+
+Fixed by recording `best_epoch_learning_rate` (the LR in effect at the
+epoch actually saved as best) into the checkpoint in
+`train_spectral_model()`. `fine_tune_on_target_domains()` now compares
+`FINE_TUNE_LEARNING_RATE` against that recorded value right after loading
+the base checkpoint and prints a `WARNING` if fine-tuning's LR isn't
+actually lower -- a diagnostic, not an automatic override, so you can
+decide whether to lower `FINE_TUNE_LEARNING_RATE` based on what the base
+run actually converged at.
