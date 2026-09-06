@@ -666,3 +666,25 @@ validation reporting (`build_per_source_val_loaders`), source
 oversampling (`SOURCE_OVERSAMPLE_WEIGHTS`), `fine_tune_on_target_domains`,
 EMA, the live training-curve plot, and the core architecture
 (`TemporalEncoder`, `DepthResolvedTailEncoder`, `SpectralSmoother`).
+
+## Faster LR decay after the validation minimum
+
+A real (EMA-smoothed) run showed val MAE bottom out at epoch 5 -- just
+below the constant baseline -- then climb for 5 straight epochs back past
+that baseline, while train MAE kept falling smoothly the entire time.
+That's real, sustained overfitting resuming after the minimum, not
+epoch-to-epoch noise. The cause: `SCHEDULER_PATIENCE = 10` meant the LR
+would not have halved until epoch 15 (10 epochs past the epoch-5 best),
+so the optimizer kept taking full-sized steps for 10 more epochs while
+actively overfitting.
+
+`SCHEDULER_PATIENCE` lowered `10 -> 3` so the LR backs off much sooner
+after validation stops improving, before the model has had that much room
+to drift past its best point. `EARLY_STOPPING_PATIENCE` scaled down
+`20 -> 12` to match (roughly 4x the new scheduler patience, so about 3 LR
+halvings still get a chance to find a better minimum before training
+gives up for good, rather than burning most of the patience budget at a
+single, too-high LR). Note that the checkpoint actually saved was never
+at risk from this climb -- `best_state` only updates on improvement -- so
+this change is about training efficiency and giving the optimizer a real
+chance at a better minimum, not about correctness of what gets saved.

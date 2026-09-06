@@ -206,8 +206,19 @@ EMA_DECAY = 0.999
 NUM_WORKERS = 0
 PIN_MEMORY = torch.cuda.is_available()
 
-EARLY_STOPPING_PATIENCE = 20
-SCHEDULER_PATIENCE = 10
+# A real run showed val MAE bottom out at epoch 5 (just below the
+# constant baseline), then climb for 5 straight epochs back past that
+# baseline while train MAE kept falling smoothly the whole time -- real,
+# sustained overfitting resuming after the minimum, not noise.
+# SCHEDULER_PATIENCE=10 meant the LR would not have halved until epoch 15
+# (10 epochs past best epoch 5), so the optimizer kept taking full-sized
+# steps for 10 epochs while actively overfitting. Lowered so the LR backs
+# off much sooner after validation stops improving, before the model has
+# had that much room to drift. EARLY_STOPPING_PATIENCE scaled down to
+# match (roughly 4x the scheduler patience, so ~3 LR halvings still get a
+# chance before training gives up for good).
+EARLY_STOPPING_PATIENCE = 12
+SCHEDULER_PATIENCE = 3
 MIN_DELTA = 1.0e-8
 GRADIENT_CLIP_NORM = 2.0
 
