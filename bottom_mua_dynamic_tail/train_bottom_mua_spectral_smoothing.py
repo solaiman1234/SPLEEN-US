@@ -49,8 +49,13 @@ can pool evidence from a local neighborhood of other wavelengths instead
 of standing entirely on its own TPSF. It starts as the identity function
 and only begins contributing once training shows it reduces the loss.
 Per-wavelength TPSF input normalization (a length-169 scale vector
-instead of one dataset-wide scalar) is used for the same reason: real
-source/detector responses aren't uniform across wavelength.
+instead of one dataset-wide scalar) was originally used for the same
+reason: real source/detector responses aren't uniform across wavelength.
+It is now off by default (USE_PER_WAVELENGTH_INPUT_SCALE = False) because
+the input TPSF is already area-under-curve normalized per wavelength
+before it reaches this script, which already accomplishes that; applying
+this scale again was found to plausibly hurt the domains it is least
+calibrated for (see USE_PER_WAVELENGTH_INPUT_SCALE's comment).
 """
 
 import copy
@@ -134,6 +139,45 @@ SOURCE_OVERSAMPLE_WEIGHTS = {
     "simulated_close_to_experimental": 1.0,
 }
 
+# Fine-tuning: after train_spectral_model() produces a general checkpoint
+# from all three sources, fine_tune_on_target_domains() continues training
+# that checkpoint using only the sources the real test set is made of
+# (experimental phantoms + simulated_close_to_experimental), at a much
+# lower learning rate so the broad representation learned from the
+# numerically larger simulated set isn't overwritten, only specialized.
+# It reuses the exact same stratified train/val file assignment as
+# train_spectral_model (same SEED), just filtered to these two sources,
+# so the per-source validation numbers already seen for those sources
+# stay directly comparable before/after fine-tuning.
+FINE_TUNE_SOURCES = ("experimental", "simulated_close_to_experimental")
+FINE_TUNE_MODEL_PATH = SPECTRAL_MODEL_PATH.replace(".pth", "_finetuned.pth")
+FINE_TUNE_LEARNING_RATE = 1.0e-5
+FINE_TUNE_NUM_EPOCHS = 50
+FINE_TUNE_EARLY_STOPPING_PATIENCE = 10
+FINE_TUNE_SCHEDULER_PATIENCE = 5
+
+# Set True and run this file to fine-tune the checkpoint already saved at
+# SPECTRAL_MODEL_PATH instead of training a new one from scratch.
+RUN_FINE_TUNING = False
+
+# The incoming TPSF is already area-under-curve normalized per wavelength
+# (each row's own integral is fixed) before it ever reaches this script.
+# That already accomplishes estimate_per_wavelength_input_scale's stated
+# purpose -- correcting for non-uniform source/detector power across
+# wavelength -- so re-normalizing here is redundant at best. Worse,
+# estimate_per_wavelength_input_scale rescales by each wavelength's peak
+# (99th-percentile) amplitude, computed once from all training files
+# combined (~64% simulated). Once the integral is already fixed, peak
+# height is part of the physically meaningful pulse shape (a more
+# absorbing/scattering wavelength produces a broader, lower-peaked pulse
+# at the same total photon budget), and a scale estimated mostly from
+# simulated data very plausibly explains the per-source validation
+# pattern actually seen (simulated best, experimental worse, the small
+# simulated_close_to_experimental source -- the one this shared scale
+# least reflects -- more than double either). Left as a toggle rather
+# than deleted so it can still be re-tested.
+USE_PER_WAVELENGTH_INPUT_SCALE = False
+
 LEARNING_RATE = 1.0e-4
 WEIGHT_DECAY = 1.0e-5
 
@@ -164,7 +208,14 @@ TEMPORAL_DROPOUT = 0.10
 HEAD_DROPOUT = 0.10
 
 USE_TRAINING_AUGMENTATION = True
-AMPLITUDE_JITTER_STD = 0.01
+# A multiplicative amplitude factor breaks the AUC-normalization property
+# (each row's integral == a fixed constant) that the input data already
+# has by construction, training on rows whose integral is no longer
+# fixed -- a regime that never occurs in real (always-normalized) data.
+# Disabled for that reason. MAX_TIME_SHIFT and ADDITIVE_NOISE_STD are
+# unaffected by AUC normalization and still model real timing jitter and
+# measurement noise, so they are kept.
+AMPLITUDE_JITTER_STD = 0.0
 ADDITIVE_NOISE_STD = 0.001
 MAX_TIME_SHIFT = 1
 
@@ -421,9 +472,12 @@ def estimate_per_wavelength_input_scale(file_list):
 
     Returns a [N_WAVELENGTHS, 1] float32 array: the median, across
     training images, of each wavelength's own 99th-percentile amplitude.
-    Using one scale per wavelength instead of a single dataset-wide scalar
-    accounts for wavelength-dependent source power / detector response
-    instead of forcing every wavelength through the same normalization.
+    Still computed and recorded in the checkpoint for reference, but no
+    longer applied by default (see USE_PER_WAVELENGTH_INPUT_SCALE) now
+    that the input TPSF is already area-under-curve normalized per
+    wavelength upstream -- that already accounts for wavelength-dependent
+    source power / detector response, which was this function's original
+    purpose.
     """
 
     per_file_percentiles = []
@@ -695,7 +749,8 @@ class PerWavelengthNormalizedDataset(Dataset):
         mat = loadmat(file_path)
 
         tpsf = load_training_tpsf(mat, file_path)
-        tpsf = (tpsf / self.per_wavelength_scale).astype(np.float32)
+        if USE_PER_WAVELENGTH_INPUT_SCALE:
+            tpsf = (tpsf / self.per_wavelength_scale).astype(np.float32)
 
         target = load_bottom_mua_target(mat, file_path)
         late_start = load_late_start_indices(mat, file_path)
@@ -719,6 +774,30 @@ def flatten_image_batch(tpsf, target=None, wavelength=None, late_start=None):
     late_start_flat = None if late_start is None else late_start.reshape(-1, 1)
 
     return tpsf_flat, target_flat, wavelength_flat, late_start_flat
+
+
+def build_per_source_val_loaders(val_files, source_lookup, per_wavelength_scale, raw_wavelengths, labels=None):
+    """One DataLoader per data source found in val_files (or just the
+    sources in `labels`, if given), for per-source diagnostic reporting.
+    """
+
+    loaders = {}
+    label_set = labels if labels is not None else sorted(set(source_lookup.values()))
+    for label in label_set:
+        source_val_files = [f for f in val_files if source_lookup[f] == label]
+        if not source_val_files:
+            continue
+        source_val_dataset = PerWavelengthNormalizedDataset(
+            file_list=source_val_files,
+            per_wavelength_scale=per_wavelength_scale,
+            wavelength_values=raw_wavelengths,
+            augment=False,
+        )
+        loaders[label] = DataLoader(
+            source_val_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+        )
+    return loaders
 
 
 # ============================================================
@@ -1341,21 +1420,9 @@ def train_spectral_model():
     # reporting each epoch -- the combined val_loader above still drives
     # the scheduler and best-checkpoint selection, so switching this on
     # does not change what "best" means.
-    per_source_val_loaders = {}
-    for label in sorted(set(source_lookup.values())):
-        source_val_files = [f for f in val_files if source_lookup[f] == label]
-        if not source_val_files:
-            continue
-        source_val_dataset = PerWavelengthNormalizedDataset(
-            file_list=source_val_files,
-            per_wavelength_scale=per_wavelength_scale,
-            wavelength_values=raw_wavelengths,
-            augment=False,
-        )
-        per_source_val_loaders[label] = DataLoader(
-            source_val_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-        )
+    per_source_val_loaders = build_per_source_val_loaders(
+        val_files, source_lookup, per_wavelength_scale, raw_wavelengths
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -1488,7 +1555,8 @@ def train_spectral_model():
         "spectral_tv_loss_weight": SPECTRAL_TV_LOSS_WEIGHT,
         "tail_extraction": "depth_resolved_grouped_by_late_start",
         "wavelength_usage": "raw_scalar_direct",
-        "wavelength_scale_mode": "per_wavelength",
+        "wavelength_scale_mode": "per_wavelength" if USE_PER_WAVELENGTH_INPUT_SCALE else "auc_normalized_upstream",
+        "use_per_wavelength_input_scale": USE_PER_WAVELENGTH_INPUT_SCALE,
         "per_wavelength_input_scale": per_wavelength_scale,
         "wavelength_file": WAVELENGTH_FILE,
         "wavelength_key": WAVELENGTH_KEY,
@@ -1510,5 +1578,214 @@ def train_spectral_model():
     print(f"Checkpoint saved to:\n{SPECTRAL_MODEL_PATH}")
 
 
+# ============================================================
+# 14. FINE-TUNING ON THE TEST SET'S DOMAINS
+# ============================================================
+
+def fine_tune_on_target_domains():
+    """Continues training an existing SPECTRAL_MODEL_PATH checkpoint using
+    only FINE_TUNE_SOURCES, at FINE_TUNE_LEARNING_RATE.
+
+    Reuses the exact same stratified split (same SEED) as
+    train_spectral_model, filtered down to the target sources, so the
+    fine-tuning validation files are the same ones already reported on in
+    the general run -- results stay directly comparable before/after.
+    """
+
+    if not os.path.isfile(SPECTRAL_MODEL_PATH):
+        raise FileNotFoundError(
+            f"No checkpoint found at:\n{SPECTRAL_MODEL_PATH}\n"
+            f"Run train_spectral_model() first to produce one to fine-tune."
+        )
+
+    if not os.path.isdir(TRAIN_DIR):
+        raise FileNotFoundError(f"Training directory was not found:\n{TRAIN_DIR}")
+
+    raw_wavelengths, _ = load_wavelength_vector()
+
+    wavelength_absolute_path = os.path.normcase(os.path.abspath(WAVELENGTH_FILE))
+    all_files = []
+    for file_path in sorted(glob(os.path.join(TRAIN_DIR, "*.mat"))):
+        if os.path.normcase(os.path.abspath(file_path)) == wavelength_absolute_path:
+            continue
+        all_files.append(file_path)
+
+    source_lookup = build_source_lookup(all_files)
+    train_files, val_files, _ = stratified_train_val_split(all_files, source_lookup)
+
+    fine_tune_train_files = [f for f in train_files if source_lookup[f] in FINE_TUNE_SOURCES]
+    fine_tune_val_files = [f for f in val_files if source_lookup[f] in FINE_TUNE_SOURCES]
+
+    if not fine_tune_train_files or not fine_tune_val_files:
+        raise RuntimeError("No fine-tuning training or validation files found for FINE_TUNE_SOURCES.")
+
+    print(f"\nFine-tuning on sources: {FINE_TUNE_SOURCES}")
+    print(f"  Fine-tune train files: {len(fine_tune_train_files)}")
+    print(f"  Fine-tune val files:   {len(fine_tune_val_files)}")
+
+    per_wavelength_scale = estimate_per_wavelength_input_scale(fine_tune_train_files)
+
+    train_dataset = PerWavelengthNormalizedDataset(
+        file_list=fine_tune_train_files,
+        per_wavelength_scale=per_wavelength_scale,
+        wavelength_values=raw_wavelengths,
+        augment=USE_TRAINING_AUGMENTATION,
+    )
+    val_dataset = PerWavelengthNormalizedDataset(
+        file_list=fine_tune_val_files,
+        per_wavelength_scale=per_wavelength_scale,
+        wavelength_values=raw_wavelengths,
+        augment=False,
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True,
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+    )
+    # The combined loader above -- both FINE_TUNE_SOURCES together -- drives
+    # early stopping and best-checkpoint selection, since
+    # simulated_close_to_experimental alone is too small (a handful of
+    # files) for that decision to be reliable on its own.
+    val_loader = DataLoader(
+        val_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False,
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+    )
+
+    per_source_val_loaders = build_per_source_val_loaders(
+        fine_tune_val_files, source_lookup, per_wavelength_scale, raw_wavelengths,
+        labels=FINE_TUNE_SOURCES,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    base_checkpoint = torch.load(SPECTRAL_MODEL_PATH, map_location=device)
+
+    model = BottomMuaSpectralNet().to(device)
+    model.load_state_dict(base_checkpoint["model_state_dict"])
+    print(
+        f"Loaded checkpoint from epoch {base_checkpoint.get('best_epoch', '?')} "
+        f"(validation MAE {base_checkpoint.get('best_validation_bottom_mua_mae', float('nan')):.6e})."
+    )
+
+    criterion = build_loss().to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=FINE_TUNE_LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=FINE_TUNE_SCHEDULER_PATIENCE, min_lr=1.0e-7
+    )
+
+    best_val_mae = float("inf")
+    best_epoch = 0
+    best_state = None
+    epochs_without_improvement = 0
+
+    train_mae_history = []
+    val_mae_history = []
+
+    for epoch in range(FINE_TUNE_NUM_EPOCHS):
+        model.train()
+
+        absolute_error_sum = 0.0
+        sample_count = 0
+
+        for tpsf, target, wavelength, late_start in train_loader:
+            tpsf = tpsf.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+            wavelength = wavelength.to(device, non_blocking=True)
+            late_start = late_start.to(device, non_blocking=True)
+
+            tpsf, target, wavelength, late_start = flatten_image_batch(
+                tpsf, target, wavelength, late_start
+            )
+
+            optimizer.zero_grad(set_to_none=True)
+
+            prediction, supervised_profiles = model(tpsf, wavelength, late_start)
+
+            primary_loss = criterion(prediction, target)
+            aux_loss, plateau_loss = depth_profile_auxiliary_losses(supervised_profiles, target)
+
+            loss = primary_loss + AUX_DEPTH_LOSS_WEIGHT * aux_loss + PLATEAU_LOSS_WEIGHT * plateau_loss
+
+            if SPECTRAL_TV_LOSS_WEIGHT > 0.0:
+                loss = loss + SPECTRAL_TV_LOSS_WEIGHT * spectral_total_variation_loss(prediction)
+
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Non-finite fine-tuning loss detected.")
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIP_NORM)
+            optimizer.step()
+
+            raw_error = prediction.detach() - target
+            count = raw_error.numel()
+            absolute_error_sum += torch.abs(raw_error).sum().item()
+            sample_count += count
+
+        train_mae = absolute_error_sum / sample_count
+        metrics = validate_spectral(model, val_loader, criterion, device)
+
+        scheduler.step(metrics["bottom_mua_mae"])
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        train_mae_history.append(train_mae)
+        val_mae_history.append(metrics["bottom_mua_mae"])
+
+        print(
+            f"[Fine-tune] Epoch [{epoch + 1:03d}/{FINE_TUNE_NUM_EPOCHS}] | "
+            f"Train MAE={train_mae:.6e} | "
+            f"Val MAE={metrics['bottom_mua_mae']:.6e} | "
+            f"Val RMSE={metrics['bottom_mua_rmse']:.6e} | "
+            f"LR={current_lr:.2e}"
+        )
+        for label, loader in per_source_val_loaders.items():
+            source_metrics = validate_spectral(model, loader, criterion, device)
+            print(
+                f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
+                f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e}"
+            )
+
+        if metrics["bottom_mua_mae"] < best_val_mae - MIN_DELTA:
+            best_val_mae = metrics["bottom_mua_mae"]
+            best_epoch = epoch + 1
+            epochs_without_improvement = 0
+            best_state = copy.deepcopy(model.state_dict())
+            print(f"  -> Best fine-tuned model updated at epoch {best_epoch}.")
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= FINE_TUNE_EARLY_STOPPING_PATIENCE:
+            print("\nFine-tuning early stopping activated.")
+            break
+
+    if best_state is None:
+        raise RuntimeError("No best fine-tuned model state was captured.")
+
+    fine_tune_checkpoint = dict(base_checkpoint)
+    fine_tune_checkpoint.update({
+        "model_state_dict": best_state,
+        "architecture": "bottom_mua_depth_resolved_spectral_smoothing_finetuned",
+        "fine_tune_sources": FINE_TUNE_SOURCES,
+        "fine_tune_learning_rate": FINE_TUNE_LEARNING_RATE,
+        "fine_tune_base_checkpoint": SPECTRAL_MODEL_PATH,
+        "fine_tune_per_wavelength_input_scale": per_wavelength_scale,
+        "fine_tune_best_epoch": best_epoch,
+        "fine_tune_best_validation_bottom_mua_mae": best_val_mae,
+        "fine_tune_train_bottom_mua_mae_history": train_mae_history,
+        "fine_tune_val_bottom_mua_mae_history": val_mae_history,
+    })
+
+    torch.save(fine_tune_checkpoint, FINE_TUNE_MODEL_PATH)
+
+    print("\nFine-tuning complete.")
+    print(f"Best fine-tune epoch: {best_epoch}")
+    print(f"Best fine-tune validation bottom-mua MAE: {best_val_mae:.6e}")
+    print(f"Fine-tuned checkpoint saved to:\n{FINE_TUNE_MODEL_PATH}")
+
+
 if __name__ == "__main__":
-    train_spectral_model()
+    if RUN_FINE_TUNING:
+        fine_tune_on_target_domains()
+    else:
+        train_spectral_model()

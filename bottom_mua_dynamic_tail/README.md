@@ -361,3 +361,76 @@ split with one that partitions each source separately:
   validation number into three, so you can see directly whether the model
   is fitting simulated data much better than experimental before deciding
   whether oversampling or anything architectural is actually needed.
+
+The first real run under this split (best epoch 92) showed exactly the
+gap this was built to surface: `simulated` MAE 7.12e-4, `experimental`
+MAE 7.85e-4, `simulated_close_to_experimental` MAE 1.54e-3 -- more than
+double either other source, and one of the two domains the real test set
+is made of. That result led directly to the two changes below.
+
+## Removing the now-redundant (and likely harmful) per-wavelength scale
+
+The incoming TPSF is already area-under-curve normalized per wavelength
+(each row's own integral is fixed) before it reaches this script. That
+already accomplishes what `estimate_per_wavelength_input_scale` /
+`PerWavelengthNormalizedDataset` were built for -- correcting non-uniform
+source/detector power across wavelength -- so applying it again is
+redundant at best.
+
+It is very plausibly worse than redundant, and the per-source validation
+gap above is consistent with why: `estimate_per_wavelength_input_scale`
+rescales by each wavelength's **peak** (99th-percentile) amplitude, not
+its integral, computed once from all training files combined (~64%
+simulated). Once the integral is already fixed, peak height is part of
+the physically meaningful pulse shape -- a more absorbing/scattering
+wavelength produces a broader, lower-peaked pulse at the same total
+photon budget -- so a peak-based scale estimated mostly from simulated
+data can systematically mis-scale the sources it least reflects. That
+predicts exactly the observed ordering: simulated best (the scale fits
+it), experimental worse, and the smallest source
+(`simulated_close_to_experimental`, with the least influence on that
+shared scale despite needing the most correction) worst of all.
+
+`USE_PER_WAVELENGTH_INPUT_SCALE` (default `False`) turns this off without
+deleting the function, so it can still be re-tested if needed --
+`estimate_per_wavelength_input_scale` is still computed and recorded in
+the checkpoint for reference either way.
+
+`AMPLITUDE_JITTER_STD` is set to `0.0` for a related reason: multiplying
+a whole TPSF row by a random factor breaks the fixed-integral property
+the input already has by construction, training on rows whose integral
+is no longer constant -- a regime that never occurs in real,
+always-normalized data. `MAX_TIME_SHIFT` and `ADDITIVE_NOISE_STD` are
+unaffected by AUC normalization (timing jitter and per-bin measurement
+noise are still real regardless of integral scale) and are kept.
+
+## Fine-tuning toward the test set's domains
+
+The real test set is experimental phantoms plus a subset of
+`simulated_close_to_experimental` -- exactly the two weaker-performing
+sources above, and not `simulated`, which is only there to teach the
+model general DTOF-to-mua structure from an abundantly large dataset.
+`fine_tune_on_target_domains()` is a second training phase: it loads the
+checkpoint `train_spectral_model()` already produced, then continues
+training it using only `FINE_TUNE_SOURCES = ("experimental",
+"simulated_close_to_experimental")`, at a much lower learning rate
+(`FINE_TUNE_LEARNING_RATE = 1e-5`, a tenth of the main `LEARNING_RATE`)
+so the broad representation learned from the numerically larger
+simulated set is specialized rather than overwritten.
+
+It reuses the exact same stratified train/val file assignment as
+`train_spectral_model` (same `SEED`), just filtered down to the two
+target sources, so the fine-tuning validation files are the identical
+ones already reported on in the general run -- before/after numbers stay
+directly comparable. Early stopping and best-checkpoint selection during
+fine-tuning use the **combined** validation set across both target
+sources, not `simulated_close_to_experimental` alone, since that source's
+validation split is only a handful of files -- too few for a reliable
+stopping decision by itself, even though it's still reported separately
+each epoch via `per_source_val_loaders`.
+
+Set `RUN_FINE_TUNING = True` and run this file to fine-tune the checkpoint
+already saved at `SPECTRAL_MODEL_PATH` instead of training a new one from
+scratch; the result is saved separately to `FINE_TUNE_MODEL_PATH`
+(`SPECTRAL_MODEL_PATH` with `_finetuned` appended), so both the general
+and fine-tuned checkpoints are kept for comparison.
