@@ -550,3 +550,44 @@ arbitrary sorted positions.
 Any checkpoint or per-source validation numbers from before this fix
 should not be trusted or compared against future runs -- the underlying
 groups were different.
+
+## Anti-overfitting pass (after the classification fix)
+
+With the split fixed, a real run showed train MAE falling fast (3.75e-3 ->
+1.62e-3 in 6 epochs) while overall val MAE rose *above* the constant
+baseline within 2 epochs -- classic overfitting, and unusually fast for
+this architecture. The per-source breakdown pinpointed the cause: with
+`SOURCE_OVERSAMPLE_WEIGHTS` all at `1.0`, `simulated` (~64% of training
+files) dominated every epoch's gradient signal, so `experimental` and
+`simulated_close_to_experimental` -- the real test set's actual domains --
+degraded 2-3x faster than `simulated` over the same epochs.
+
+Changes made, none touching `TemporalEncoder` / `DepthResolvedTailEncoder`
+/ `SpectralSmoother` (those were already tuned through several rounds of
+prior experiments, and narrowing them previously made both train AND val
+worse -- a capacity problem, not overfitting):
+
+- **`SOURCE_OVERSAMPLE_WEIGHTS`** -- `experimental` and
+  `simulated_close_to_experimental` raised to `2.0`/`3.0` so they get
+  roughly equal gradient mass per epoch regardless of file count, directly
+  countering the majority-source dominance seen above.
+- **`LEARNING_RATE`** `1e-4` -> `5e-5`, **`WEIGHT_DECAY`** `1e-5` -> `1e-4`
+  -- slows the early optimizer steps and penalizes large weights more.
+- **`TEMPORAL_DROPOUT`** `0.10` -> `0.20`, **`HEAD_DROPOUT`** `0.10` ->
+  `0.30` -- less room for the model to memorize per-file idiosyncrasies.
+- **`PLATEAU_LOSS_WEIGHT`** `0.05` -> `0.0` -- removed as a genuinely
+  unnecessary block: the weighted-L1 term in `depth_profile_auxiliary_losses`
+  already pulls every supervised tail window toward the same single
+  bottom-mua label, which already pushes those windows toward agreeing
+  with each other as a side effect. The explicit variance penalty on top
+  of that was redundant, and was one more term the optimizer could exploit
+  to overfit each training tail's exact shape rather than the underlying
+  decay-slope relationship. The function still computes it (for anyone who
+  wants to re-enable it), it just no longer contributes to the loss.
+
+**Action needed**: re-run `train_spectral_model()` with these settings and
+compare the new per-epoch curve (via the live PNG) against the pattern
+above -- val MAE should track train MAE much more closely for longer
+before diverging, and the `experimental`/`simulated_close_to_experimental`
+per-source numbers should stop blowing up disproportionately to
+`simulated`.

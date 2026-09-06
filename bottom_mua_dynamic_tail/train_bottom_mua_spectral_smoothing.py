@@ -139,17 +139,19 @@ SOURCE_VAL_FRACTION_OVERRIDES = {
     "simulated_close_to_experimental": 0.10,
 }
 
-# Per-source oversampling weight for the training sampler. All 1.0 means
-# plain uniform sampling (equivalent to the previous behavior) -- left
-# neutral until the per-source validation MAE below shows whether
-# experimental accuracy actually lags simulated accuracy. If it does,
-# raising "experimental" and/or "simulated_close_to_experimental" (e.g.
-# to 2.0-3.0) oversamples them relative to their file count, which
-# currently makes up only ~36% of all training files combined.
+# Per-source oversampling weight for the training sampler. Turned on: a
+# real run's per-source validation MAE showed exactly the pattern this
+# was meant to catch -- with uniform sampling, "simulated" (~64% of
+# training files) dominates every epoch's gradient signal, so the model
+# drifted toward fitting it while "experimental" and
+# "simulated_close_to_experimental" (the real test set's domains)
+# degraded 2-3x faster over the same epochs. Weighting the minority
+# sources higher gives them roughly equal total gradient mass per epoch
+# regardless of file count, directly countering that.
 SOURCE_OVERSAMPLE_WEIGHTS = {
     "simulated": 1.0,
-    "experimental": 1.0,
-    "simulated_close_to_experimental": 1.0,
+    "experimental": 2.0,
+    "simulated_close_to_experimental": 3.0,
 }
 
 # Fine-tuning: after train_spectral_model() produces a general checkpoint
@@ -199,8 +201,14 @@ FINE_TUNE_TRAINING_CURVE_PATH = FINE_TUNE_MODEL_PATH.replace(".pth", "_training_
 # than deleted so it can still be re-tested.
 USE_PER_WAVELENGTH_INPUT_SCALE = False
 
-LEARNING_RATE = 1.0e-4
-WEIGHT_DECAY = 1.0e-5
+# A real run showed train MAE falling fast while val MAE rose above the
+# constant baseline within 2 epochs -- overfitting starting far earlier
+# than this architecture should need. LEARNING_RATE and WEIGHT_DECAY were
+# both loosened for that run; tightened back to slow the early optimizer
+# steps and penalize large weights more, alongside the dropout increases
+# below.
+LEARNING_RATE = 5.0e-5
+WEIGHT_DECAY = 1.0e-4
 
 NUM_WORKERS = 0
 PIN_MEMORY = torch.cuda.is_available()
@@ -224,9 +232,13 @@ TEMPORAL_POOL_BINS = 4
 # separate it from the bottom layer's), not of overfitting. Restored to
 # its original width.
 TEMPORAL_FEATURE_DIM = 48
-TEMPORAL_DROPOUT = 0.10
+# Raised from 0.10 alongside the WEIGHT_DECAY/LEARNING_RATE changes above
+# to fight the same fast-overfitting pattern -- dropout in both the
+# per-branch encoders and the head gives the model less room to memorize
+# per-file idiosyncrasies rather than the underlying TPSF-to-mua relationship.
+TEMPORAL_DROPOUT = 0.20
 
-HEAD_DROPOUT = 0.10
+HEAD_DROPOUT = 0.30
 
 USE_TRAINING_AUGMENTATION = True
 # A multiplicative amplitude factor breaks the AUC-normalization property
@@ -268,7 +280,15 @@ NUM_SUPERVISED_TAIL_WINDOWS = 5
 LATE_WEIGHT_POWER = 2.0
 
 AUX_DEPTH_LOSS_WEIGHT = 0.3
-PLATEAU_LOSS_WEIGHT = 0.05
+# The weighted-L1 term above already pulls every supervised window toward
+# the same single bottom-mua label, which already pushes those windows
+# toward agreeing with each other as a side effect -- an explicit
+# variance penalty on top of that is largely redundant, and is one more
+# term the optimizer can exploit to overfit the training tails' exact
+# shapes rather than the underlying decay-slope relationship. Removed
+# (weight 0.0) as an unnecessary block; depth_profile_auxiliary_losses
+# still computes it for anyone who wants to re-enable it.
+PLATEAU_LOSS_WEIGHT = 0.0
 
 # Spectral-smoothing settings. SPECTRAL_SMOOTHING_KERNEL_SIZE=11 also made
 # results worse (likely flattening genuine peaks/troughs by pooling too
