@@ -812,3 +812,24 @@ the base checkpoint and prints a `WARNING` if fine-tuning's LR isn't
 actually lower -- a diagnostic, not an automatic override, so you can
 decide whether to lower `FINE_TUNE_LEARNING_RATE` based on what the base
 run actually converged at.
+
+## Tightening fine-tuning's own scheduler/early-stopping patience
+
+A real fine-tuning run showed train MAE decreasing while val MAE didn't --
+the same overfits-after-the-minimum pattern already found and fixed in
+the main training loop (`SCHEDULER_PATIENCE`/`EARLY_STOPPING_PATIENCE`),
+just never carried over to `fine_tune_on_target_domains()`, which still
+had the original `FINE_TUNE_SCHEDULER_PATIENCE=5` /
+`FINE_TUNE_EARLY_STOPPING_PATIENCE=10`. If anything this pattern is more
+likely during fine-tuning, not less: its training pool is only two
+sources, and the inverse-frequency `WeightedRandomSampler` gives the tiny
+`simulated_close_to_experimental` group (~38 train files) equal total
+gradient mass to the much larger `experimental` group, meaning the model
+gets shown that small set's exact files repeatedly -- a strong setup for
+memorizing training files fast while genuinely held-out validation files
+don't improve.
+
+`FINE_TUNE_SCHEDULER_PATIENCE` lowered `5 -> 2`, `FINE_TUNE_EARLY_STOPPING_PATIENCE`
+lowered `10 -> 8`, mirroring the main run's fix so the fine-tuning LR
+backs off sooner after validation stops improving instead of continuing
+to overfit at full LR for several more epochs.

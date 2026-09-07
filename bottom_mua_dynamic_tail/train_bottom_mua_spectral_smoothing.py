@@ -182,8 +182,18 @@ FINE_TUNE_SOURCES = ("experimental", "simulated_close_to_experimental")
 FINE_TUNE_MODEL_PATH = SPECTRAL_MODEL_PATH.replace(".pth", "_finetuned.pth")
 FINE_TUNE_LEARNING_RATE = 1.0e-5
 FINE_TUNE_NUM_EPOCHS = 50
-FINE_TUNE_EARLY_STOPPING_PATIENCE = 10
-FINE_TUNE_SCHEDULER_PATIENCE = 5
+
+# Lowered to match the same fix applied to SCHEDULER_PATIENCE/
+# EARLY_STOPPING_PATIENCE above: a real run showed the main training loop
+# overfitting fast after its validation minimum because the LR stayed
+# high for too many further epochs. Fine-tuning's own pool is smaller
+# than the main run's (only two sources, and the WeightedRandomSampler
+# gives the tiny simulated_close_to_experimental group equal gradient
+# mass to the much larger experimental group), so the same fast-overfit
+# pattern is if anything more likely here, not less -- this was never
+# revisited when the main run's patience was tightened.
+FINE_TUNE_EARLY_STOPPING_PATIENCE = 8
+FINE_TUNE_SCHEDULER_PATIENCE = 2
 
 # Set True and run this file to fine-tune the checkpoint already saved at
 # SPECTRAL_MODEL_PATH instead of training a new one from scratch.
