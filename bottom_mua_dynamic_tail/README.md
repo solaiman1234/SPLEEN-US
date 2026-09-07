@@ -432,6 +432,36 @@ validation split is only a handful of files -- too few for a reliable
 stopping decision by itself, even though it's still reported separately
 each epoch via `per_source_val_loaders`.
 
+## Fine-tuning's sampler was over-equalizing the tiny source
+
+The two `FINE_TUNE_SOURCES` are themselves imbalanced roughly 30:1
+(`experimental` vs. `simulated_close_to_experimental`). The fine-tuning
+sampler originally weighted each sample by `1 / (its source's file
+count)`, giving every source exactly equal **total** sampling mass per
+epoch regardless of size -- at a 30:1 imbalance that meant each
+`simulated_close_to_experimental` file was drawn roughly 27x more often
+per epoch than each `experimental` file.
+
+A real run showed exactly the failure that predicts: after fixing the
+LR mismatch above, `simulated_close_to_experimental`'s validation MAE
+still improved during fine-tuning while `experimental`'s -- the actual
+real-phantom target -- did not move at all. That's consistent with the
+model memorizing the ~38 heavily-repeated `simulated_close_to_experimental`
+training files (which correlates with its own tiny held-out validation
+split, since both are drawn from the same narrow distribution) rather
+than genuinely improving on `experimental`, which was simultaneously
+getting less than half its previous per-epoch exposure to make room for
+that oversampling.
+
+Fixed by reusing the exact same fixed per-source multipliers
+`SOURCE_OVERSAMPLE_WEIGHTS` already uses for the main run (`experimental:
+2.0`, `simulated_close_to_experimental: 3.0`, applied per file rather than
+divided by count) instead of a second, far more aggressive full-equalization
+scheme that was never validated on its own. This keeps
+`simulated_close_to_experimental` oversampled (~1.5x per file relative to
+`experimental` here, vs. ~27x under the old full equalization) without
+suppressing `experimental`'s exposure enough to stall its own learning.
+
 Set `RUN_FINE_TUNING = True` and run this file to fine-tune the checkpoint
 already saved at `SPECTRAL_MODEL_PATH` instead of training a new one from
 scratch; the result is saved separately to `FINE_TUNE_MODEL_PATH`

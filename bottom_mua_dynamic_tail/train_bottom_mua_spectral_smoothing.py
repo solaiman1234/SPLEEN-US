@@ -1812,18 +1812,24 @@ def fine_tune_on_target_domains():
     )
 
     # FINE_TUNE_SOURCES are themselves wildly imbalanced (experimental
-    # outnumbers simulated_close_to_experimental roughly 30:1), which would
-    # leave the fine-tuning batches almost entirely experimental and defeat
-    # the point of specializing toward both target domains. Weight each
-    # sample by the inverse of its own source's file count so every source
-    # contributes roughly equal total mass per epoch, regardless of how
-    # many files it has.
-    fine_tune_source_counts = {}
-    for file_path in fine_tune_train_files:
-        label = source_lookup[file_path]
-        fine_tune_source_counts[label] = fine_tune_source_counts.get(label, 0) + 1
+    # outnumbers simulated_close_to_experimental roughly 30:1). This
+    # previously weighted each sample by 1/(its source's file count), which
+    # gives every source exactly equal TOTAL sampling mass regardless of
+    # size -- with a 30:1 file-count imbalance that means each
+    # simulated_close_to_experimental file was drawn roughly 27x more often
+    # per epoch than each experimental file. A real run showed exactly the
+    # failure mode that implies: simulated_close_to_experimental's
+    # validation MAE improved (consistent with the model memorizing its
+    # ~38 heavily-repeated training files) while experimental's validation
+    # MAE -- the actual real-phantom target -- did not improve at all,
+    # since it was getting less than half its previous per-epoch exposure.
+    # Reusing the same fixed per-source multipliers SOURCE_OVERSAMPLE_WEIGHTS
+    # already uses for the main run (a per-file weight, not divided by
+    # count) keeps the same well-tested, much milder oversampling ratio
+    # (~1.5x per file here, vs. ~27x under full equalization) instead of a
+    # second, far more aggressive scheme that was never validated on its own.
     fine_tune_sample_weights = [
-        1.0 / fine_tune_source_counts[source_lookup[file_path]]
+        SOURCE_OVERSAMPLE_WEIGHTS[source_lookup[file_path]]
         for file_path in fine_tune_train_files
     ]
     fine_tune_sampler = WeightedRandomSampler(
