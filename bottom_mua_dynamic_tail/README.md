@@ -414,9 +414,12 @@ model general DTOF-to-mua structure from an abundantly large dataset.
 checkpoint `train_spectral_model()` already produced, then continues
 training it using only `FINE_TUNE_SOURCES = ("experimental",
 "simulated_close_to_experimental")`, at a much lower learning rate
-(`FINE_TUNE_LEARNING_RATE = 1e-5`, a tenth of the main `LEARNING_RATE`)
-so the broad representation learned from the numerically larger
-simulated set is specialized rather than overwritten.
+(`FINE_TUNE_LEARNING_RATE = 2e-6`) so the broad representation learned
+from the numerically larger simulated set is specialized rather than
+overwritten. See "Fine-tuning always starts a fresh optimizer -- LR
+mismatch check" below for why this needs to stay below whatever LR the
+base run actually converged at, not just below its starting
+`LEARNING_RATE`.
 
 It reuses the exact same stratified train/val file assignment as
 `train_spectral_model` (same `SEED`), just filtered down to the two
@@ -812,6 +815,18 @@ the base checkpoint and prints a `WARNING` if fine-tuning's LR isn't
 actually lower -- a diagnostic, not an automatic override, so you can
 decide whether to lower `FINE_TUNE_LEARNING_RATE` based on what the base
 run actually converged at.
+
+**This mismatch was confirmed on a real run, not just theoretical**: the
+base checkpoint's best epoch had already decayed to `6.25e-6`, while
+`FINE_TUNE_LEARNING_RATE` was `1e-5` -- larger, not smaller. That run's
+fine-tuning validation MAE never beat its own epoch 1 (see the patience
+section below), consistent with the first fine-tune steps being large
+enough to kick the weights out of the minimum the base checkpoint was
+already sitting in, rather than gently specializing it.
+`FINE_TUNE_LEARNING_RATE` was lowered to `2e-6` -- below that run's
+converged `6.25e-6` -- specifically because of this. If your own base
+checkpoint converges at a different LR, check its
+`best_epoch_learning_rate` and keep `FINE_TUNE_LEARNING_RATE` below it.
 
 ## Tightening fine-tuning's own scheduler/early-stopping patience
 

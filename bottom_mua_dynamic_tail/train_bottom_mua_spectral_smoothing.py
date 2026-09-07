@@ -180,7 +180,19 @@ SOURCE_OVERSAMPLE_WEIGHTS = {
 # stay directly comparable before/after fine-tuning.
 FINE_TUNE_SOURCES = ("experimental", "simulated_close_to_experimental")
 FINE_TUNE_MODEL_PATH = SPECTRAL_MODEL_PATH.replace(".pth", "_finetuned.pth")
-FINE_TUNE_LEARNING_RATE = 1.0e-5
+# Lowered from 1.0e-5: a real run's base checkpoint had its best epoch at an
+# LR of 6.25e-6 (ReduceLROnPlateau had already decayed it down from
+# LEARNING_RATE=5.0e-5 by then), so the old 1.0e-5 fine-tune LR was actually
+# LARGER than the step size the optimizer had already converged to -- the
+# opposite of "gentle specialization." That run's fine-tuning never beat its
+# epoch-1 validation MAE at all, consistent with those first fine-tune steps
+# being big enough to kick the weights out of the minimum the base
+# checkpoint was already sitting in. Set below the base run's own converged
+# LR so fine-tuning steps are always smaller than what training had settled
+# into -- check your own base checkpoint's "best_epoch_learning_rate" (only
+# present if you're on the version of this script with the LR-mismatch
+# warning) and keep this below it.
+FINE_TUNE_LEARNING_RATE = 2.0e-6
 FINE_TUNE_NUM_EPOCHS = 50
 
 # Lowered to match the same fix applied to SCHEDULER_PATIENCE/
