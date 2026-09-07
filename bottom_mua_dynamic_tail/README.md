@@ -407,78 +407,78 @@ noise are still real regardless of integral scale) and are kept.
 ## Fine-tuning toward the test set's domains
 
 The real test set is experimental phantoms plus a subset of
-`simulated_close_to_experimental` -- exactly the two weaker-performing
-sources above, and not `simulated`, which is only there to teach the
-model general DTOF-to-mua structure from an abundantly large dataset.
-`fine_tune_on_target_domains()` is a second training phase: it loads the
-checkpoint `train_spectral_model()` already produced, then continues
-training it using only `FINE_TUNE_SOURCES = ("experimental",
-"simulated_close_to_experimental")`, at a much lower learning rate
-(`FINE_TUNE_LEARNING_RATE = 2e-6`) so the broad representation learned
-from the numerically larger simulated set is specialized rather than
-overwritten. See "Fine-tuning always starts a fresh optimizer -- LR
-mismatch check" below for why this needs to stay below whatever LR the
-base run actually converged at, not just below its starting
-`LEARNING_RATE`.
+`simulated_close_to_experimental`, and not `simulated`, which is only
+there to teach the model general DTOF-to-mua structure from an
+abundantly large dataset. `fine_tune_on_target_domains()` is a second
+training phase: it loads the checkpoint `train_spectral_model()` already
+produced, then continues training it using only `FINE_TUNE_SOURCES`, at
+a much lower learning rate (`FINE_TUNE_LEARNING_RATE = 2e-6`) so the
+broad representation learned from the numerically larger simulated set
+is specialized rather than overwritten. See "Fine-tuning always starts a
+fresh optimizer -- LR mismatch check" below for why this needs to stay
+below whatever LR the base run actually converged at, not just below its
+starting `LEARNING_RATE`.
 
 It reuses the exact same stratified train/val file assignment as
-`train_spectral_model` (same `SEED`), just filtered down to the two
-target sources, so the fine-tuning validation files are the identical
-ones already reported on in the general run -- before/after numbers stay
-directly comparable. Early stopping and best-checkpoint selection during
-fine-tuning use the **combined** validation set across both target
-sources, not `simulated_close_to_experimental` alone, since that source's
-validation split is only a handful of files -- too few for a reliable
-stopping decision by itself, even though it's still reported separately
-each epoch via `per_source_val_loaders`.
+`train_spectral_model` (same `SEED`), just filtered down to
+`FINE_TUNE_SOURCES`, so the fine-tuning validation files are the
+identical ones already reported on in the general run -- before/after
+numbers stay directly comparable.
 
-## Fine-tuning's sampler was over-equalizing the tiny source
+`FINE_TUNE_SOURCES` was originally `("experimental",
+"simulated_close_to_experimental")` -- both sources the real test set
+draws from. It's now restricted to `("experimental",)` (1273 files): even
+after fixing the oversampling ratio below, pooling in the tiny 42-file
+`simulated_close_to_experimental` source still meant it was competing
+with `experimental` for a share of every batch, for a source that's a
+small fraction of the real test set. Narrowing to `experimental` alone
+lets every fine-tuning step go toward the source that's actually been the
+persistent problem. The trade-off: `simulated_close_to_experimental`'s
+share of the real test set no longer gets a second, fine-tuning-specific
+pass -- it still benefits from `SOURCE_OVERSAMPLE_WEIGHTS` during the main
+run, just not from this stage.
 
-The two `FINE_TUNE_SOURCES` are themselves imbalanced roughly 30:1
-(`experimental` vs. `simulated_close_to_experimental`). The fine-tuning
-sampler originally weighted each sample by `1 / (its source's file
-count)`, giving every source exactly equal **total** sampling mass per
-epoch regardless of size -- at a 30:1 imbalance that meant each
-`simulated_close_to_experimental` file was drawn roughly 27x more often
-per epoch than each `experimental` file.
+### Fine-tuning's sampler, and the equalization bug it once had
 
-A real run showed exactly the failure that predicts: after fixing the
-LR mismatch above, `simulated_close_to_experimental`'s validation MAE
-still improved during fine-tuning while `experimental`'s -- the actual
-real-phantom target -- did not move at all. That's consistent with the
-model memorizing the ~38 heavily-repeated `simulated_close_to_experimental`
-training files (which correlates with its own tiny held-out validation
-split, since both are drawn from the same narrow distribution) rather
-than genuinely improving on `experimental`, which was simultaneously
-getting less than half its previous per-epoch exposure to make room for
-that oversampling.
+When `FINE_TUNE_SOURCES` held two sources, a per-source oversampling
+weight was needed: `experimental` outnumbered
+`simulated_close_to_experimental` roughly 30:1, so a plain shuffled loader
+would have filled nearly every batch with `experimental` rows. The
+sampler went through two versions:
 
-Fixed by reusing the exact same fixed per-source multipliers
-`SOURCE_OVERSAMPLE_WEIGHTS` already uses for the main run (`experimental:
-2.0`, `simulated_close_to_experimental: 3.0`, applied per file rather than
-divided by count) instead of a second, far more aggressive full-equalization
-scheme that was never validated on its own. This keeps
-`simulated_close_to_experimental` oversampled (~1.5x per file relative to
-`experimental` here, vs. ~27x under the old full equalization) without
-suppressing `experimental`'s exposure enough to stall its own learning.
+1. **Original**: weighted each sample by `1 / (its source's file count)`,
+   giving every source exactly equal **total** sampling mass per epoch
+   regardless of size. At a 30:1 imbalance that meant each
+   `simulated_close_to_experimental` file was drawn roughly 27x more often
+   per epoch than each `experimental` file. A real run showed exactly the
+   failure that predicts: `simulated_close_to_experimental`'s validation
+   MAE improved (consistent with the model memorizing its ~38
+   heavily-repeated training files) while `experimental`'s -- the actual
+   real-phantom target -- did not move at all, since it was getting less
+   than half its previous per-epoch exposure to make room for that
+   oversampling.
+2. **Fixed**: reused the same fixed per-source multipliers
+   `SOURCE_OVERSAMPLE_WEIGHTS` already uses for the main run
+   (`experimental: 2.0`, `simulated_close_to_experimental: 3.0`, applied
+   per file rather than divided by count) -- a much milder ~1.5x per-file
+   ratio instead of ~27x.
+
+Now that `FINE_TUNE_SOURCES` is just `("experimental",)`, this whole
+mechanism is moot: every file gets the same multiplier, so
+`fine_tune_on_target_domains()` skips the `WeightedRandomSampler` entirely
+and falls back to plain shuffling whenever only one source is present --
+the same fallback `train_spectral_model` already uses when
+`SOURCE_OVERSAMPLE_WEIGHTS` has no effect. A `WeightedRandomSampler` with
+identical weights for every file would have been pure overhead, and
+slightly worse than plain shuffling besides, since sampling-with-replacement
+can skip some files and repeat others within a single epoch instead of
+covering every file exactly once.
 
 Set `RUN_FINE_TUNING = True` and run this file to fine-tune the checkpoint
 already saved at `SPECTRAL_MODEL_PATH` instead of training a new one from
 scratch; the result is saved separately to `FINE_TUNE_MODEL_PATH`
 (`SPECTRAL_MODEL_PATH` with `_finetuned` appended), so both the general
 and fine-tuned checkpoints are kept for comparison.
-
-### Fine-tuning source imbalance fix
-
-`FINE_TUNE_SOURCES` are themselves badly imbalanced -- `experimental` has
-roughly 30x as many files as `simulated_close_to_experimental` -- so a
-plain shuffled loader over both would fill nearly every batch with
-`experimental` rows and barely touch the very source with the worst
-validation error. `fine_tune_on_target_domains()` now builds a
-`WeightedRandomSampler` for the fine-tuning train loader, weighting each
-sample by the inverse of its own source's file count so both target
-sources contribute roughly equal total mass per epoch regardless of how
-many files each has.
 
 ## Code review fixes (no training-behavior change from the above)
 

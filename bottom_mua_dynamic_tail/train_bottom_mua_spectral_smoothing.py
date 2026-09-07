@@ -170,15 +170,23 @@ SOURCE_OVERSAMPLE_WEIGHTS = {
 
 # Fine-tuning: after train_spectral_model() produces a general checkpoint
 # from all three sources, fine_tune_on_target_domains() continues training
-# that checkpoint using only the sources the real test set is made of
-# (experimental phantoms + simulated_close_to_experimental), at a much
-# lower learning rate so the broad representation learned from the
-# numerically larger simulated set isn't overwritten, only specialized.
-# It reuses the exact same stratified train/val file assignment as
-# train_spectral_model (same SEED), just filtered to these two sources,
-# so the per-source validation numbers already seen for those sources
-# stay directly comparable before/after fine-tuning.
-FINE_TUNE_SOURCES = ("experimental", "simulated_close_to_experimental")
+# that checkpoint using only FINE_TUNE_SOURCES, at a much lower learning
+# rate so the broad representation learned from the numerically larger
+# simulated set isn't overwritten, only specialized. It reuses the exact
+# same stratified train/val file assignment as train_spectral_model (same
+# SEED), just filtered to these sources, so the per-source validation
+# numbers already seen for them stay directly comparable before/after
+# fine-tuning.
+#
+# Restricted to just "experimental" (1273 files): simulated_close_to_experimental
+# was previously included too, but it's only 42 files, and even with the
+# oversampling ratio fixed (see the sampler comment below) it still adds
+# nothing to help experimental specifically -- it can only compete with it
+# for a share of every batch. Note this narrows what fine-tuning actually
+# specializes: simulated_close_to_experimental's share of the real test set
+# now only benefits from whatever it already got during the main run's
+# SOURCE_OVERSAMPLE_WEIGHTS-boosted training, not from this second pass.
+FINE_TUNE_SOURCES = ("experimental",)
 FINE_TUNE_MODEL_PATH = SPECTRAL_MODEL_PATH.replace(".pth", "_finetuned.pth")
 # Lowered from 1.0e-5: a real run's base checkpoint had its best epoch at an
 # LR of 6.25e-6 (ReduceLROnPlateau had already decayed it down from
@@ -198,12 +206,10 @@ FINE_TUNE_NUM_EPOCHS = 50
 # Lowered to match the same fix applied to SCHEDULER_PATIENCE/
 # EARLY_STOPPING_PATIENCE above: a real run showed the main training loop
 # overfitting fast after its validation minimum because the LR stayed
-# high for too many further epochs. Fine-tuning's own pool is smaller
-# than the main run's (only two sources, and the WeightedRandomSampler
-# gives the tiny simulated_close_to_experimental group equal gradient
-# mass to the much larger experimental group), so the same fast-overfit
-# pattern is if anything more likely here, not less -- this was never
-# revisited when the main run's patience was tightened.
+# high for too many further epochs. Fine-tuning's own pool (FINE_TUNE_SOURCES)
+# is smaller than the main run's, so the same fast-overfit pattern is if
+# anything more likely here, not less -- this was never revisited when the
+# main run's patience was tightened.
 FINE_TUNE_EARLY_STOPPING_PATIENCE = 8
 FINE_TUNE_SCHEDULER_PATIENCE = 2
 
@@ -1811,38 +1817,34 @@ def fine_tune_on_target_domains():
         augment=False,
     )
 
-    # FINE_TUNE_SOURCES are themselves wildly imbalanced (experimental
-    # outnumbers simulated_close_to_experimental roughly 30:1). This
-    # previously weighted each sample by 1/(its source's file count), which
-    # gives every source exactly equal TOTAL sampling mass regardless of
-    # size -- with a 30:1 file-count imbalance that means each
-    # simulated_close_to_experimental file was drawn roughly 27x more often
-    # per epoch than each experimental file. A real run showed exactly the
-    # failure mode that implies: simulated_close_to_experimental's
-    # validation MAE improved (consistent with the model memorizing its
-    # ~38 heavily-repeated training files) while experimental's validation
-    # MAE -- the actual real-phantom target -- did not improve at all,
-    # since it was getting less than half its previous per-epoch exposure.
-    # Reusing the same fixed per-source multipliers SOURCE_OVERSAMPLE_WEIGHTS
-    # already uses for the main run (a per-file weight, not divided by
-    # count) keeps the same well-tested, much milder oversampling ratio
-    # (~1.5x per file here, vs. ~27x under full equalization) instead of a
-    # second, far more aggressive scheme that was never validated on its own.
-    fine_tune_sample_weights = [
-        SOURCE_OVERSAMPLE_WEIGHTS[source_lookup[file_path]]
-        for file_path in fine_tune_train_files
-    ]
-    fine_tune_sampler = WeightedRandomSampler(
-        fine_tune_sample_weights, num_samples=len(fine_tune_train_files), replacement=True
-    )
-    train_loader = DataLoader(
-        train_dataset, batch_size=IMAGE_BATCH_SIZE, sampler=fine_tune_sampler,
-        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-    )
-    # The combined loader above -- both FINE_TUNE_SOURCES together -- drives
-    # early stopping and best-checkpoint selection, since
-    # simulated_close_to_experimental alone is too small (a handful of
-    # files) for that decision to be reliable on its own.
+    # A per-source oversampling weight only does anything when
+    # FINE_TUNE_SOURCES has more than one distinct source; with the single
+    # "experimental" source now used here, every file would get the exact
+    # same SOURCE_OVERSAMPLE_WEIGHTS multiplier, making a
+    # WeightedRandomSampler pure overhead -- and actually slightly worse
+    # than plain shuffling, since sampling-with-replacement can skip some
+    # files and repeat others within a single epoch instead of covering
+    # every file exactly once. Falls back to plain shuffling whenever only
+    # one source is present, mirroring the same fallback train_spectral_model
+    # uses when SOURCE_OVERSAMPLE_WEIGHTS has no effect.
+    fine_tune_source_labels = {source_lookup[f] for f in fine_tune_train_files}
+    if len(fine_tune_source_labels) > 1:
+        fine_tune_sample_weights = [
+            SOURCE_OVERSAMPLE_WEIGHTS[source_lookup[file_path]]
+            for file_path in fine_tune_train_files
+        ]
+        fine_tune_sampler = WeightedRandomSampler(
+            fine_tune_sample_weights, num_samples=len(fine_tune_train_files), replacement=True
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=IMAGE_BATCH_SIZE, sampler=fine_tune_sampler,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+        )
     val_loader = DataLoader(
         val_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
