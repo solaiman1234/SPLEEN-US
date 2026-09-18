@@ -74,7 +74,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from scipy.io import loadmat
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
 
 try:
     import matplotlib
@@ -110,83 +110,32 @@ TIME_GATE_END = 450
 # Doubled from 4: each step only saw 4 independent images (676 rows, but
 # those rows are 4 groups of 169 highly-correlated wavelengths, not 676
 # independent samples), which is a noisy per-step gradient estimate and
-# part of why validation bounced so much before EMA. A larger batch also
-# gives SOURCE_OVERSAMPLE_WEIGHTS' minority-source upweighting a better
-# chance of actually showing up within every step instead of being spread
-# thin across occasional batches. The model is small (~75K parameters)
-# and each image is a small tensor, so this is safe on essentially any
-# GPU with a few GB free -- lower it back to 4 if you hit an
-# out-of-memory error on your hardware.
+# part of why validation bounced so much before EMA. The model is small
+# (~75K parameters) and each image is a small tensor, so this is safe on
+# essentially any GPU with a few GB free -- lower it back to 4 if you hit
+# an out-of-memory error on your hardware.
 IMAGE_BATCH_SIZE = 8
 NUM_EPOCHS = 200
 TRAIN_FRACTION = 0.80
 
-# TRAIN_DIR mixes three data sources with a known, physically real domain
-# gap between them (different IRFs), identified by each file's own numeric
-# index parsed from its filename (e.g. DTOF_137.mat -> 137) -- NOT by its
-# position in sorted(glob(...)), which sorts filenames as plain strings
-# ("DTOF_1.mat" < "DTOF_10.mat" < "DTOF_100.mat" < "DTOF_1000.mat" < ... <
-# "DTOF_11.mat") and so does not follow numeric order at all. See
-# extract_file_number.
-#   file numbers 1..SOURCE_SIMULATED_END                          -> "simulated"
-#   file numbers SOURCE_SIMULATED_END+1..SOURCE_EXPERIMENTAL_END   -> "experimental"
-#   file numbers SOURCE_EXPERIMENTAL_END+1..end                    -> "simulated_close_to_experimental"
-# A plain random 80/20 split over all files lets validation's source mix
-# fall out by chance -- with ~64% of files simulated, validation ends up
-# mostly testing simulated-data fit even though the real test set is
-# experimental phantoms. The split below instead partitions each source
-# separately, so validation always contains a deliberate share of every
-# source rather than whatever a random shuffle happens to produce.
-SOURCE_SIMULATED_END = 2300
-SOURCE_EXPERIMENTAL_END = 3573
-SOURCE_TOTAL_EXPECTED = 3615
+# TRAIN_DIR holds two non-overlapping datasets, identified by each file's
+# own numeric index parsed from its filename (e.g. DTOF_137.mat -> 137) --
+# NOT by its position in sorted(glob(...)), which sorts filenames as plain
+# strings ("DTOF_1.mat" < "DTOF_10.mat" < "DTOF_100.mat" <
+# "DTOF_1000.mat" < ... < "DTOF_11.mat") and so does not follow numeric
+# order at all. See extract_file_number.
+#   file numbers 1..SIMULATED_FILE_MAX                          -> simulated
+#   file numbers EXPERIMENTAL_FILE_MIN..EXPERIMENTAL_FILE_MAX    -> experimental
+# train_spectral_model() trains only on the simulated files (abundant,
+# general DTOF-to-mua structure); fine_tune_on_experimental() then
+# continues training that checkpoint on only the experimental files (the
+# real test set's domain), at a much lower learning rate so the broad
+# representation isn't overwritten, only specialized. Any file numbered
+# above EXPERIMENTAL_FILE_MAX is not used by either phase.
+SIMULATED_FILE_MAX = 2300
+EXPERIMENTAL_FILE_MIN = 2301
+EXPERIMENTAL_FILE_MAX = 3573
 
-# Per-source override of the validation fraction; anything not listed
-# here uses (1 - TRAIN_FRACTION). "simulated_close_to_experimental" is
-# small (42 files) and specifically bridges the sim/experimental domain
-# gap -- holding out the usual 20% would remove ~8 of those 42 files from
-# training for comparatively little validation signal, so it defaults to
-# a smaller share. Set it to 0.0 to keep all of it in training and rely
-# entirely on the real experimental test phantoms for that source's
-# held-out check.
-SOURCE_VAL_FRACTION_OVERRIDES = {
-    "simulated_close_to_experimental": 0.10,
-}
-
-# Per-source oversampling weight for the training sampler. Turned on: a
-# real run's per-source validation MAE showed exactly the pattern this
-# was meant to catch -- with uniform sampling, "simulated" (~64% of
-# training files) dominates every epoch's gradient signal, so the model
-# drifted toward fitting it while "experimental" and
-# "simulated_close_to_experimental" (the real test set's domains)
-# degraded 2-3x faster over the same epochs. Weighting the minority
-# sources higher gives them roughly equal total gradient mass per epoch
-# regardless of file count, directly countering that.
-SOURCE_OVERSAMPLE_WEIGHTS = {
-    "simulated": 1.0,
-    "experimental": 2.0,
-    "simulated_close_to_experimental": 3.0,
-}
-
-# Fine-tuning: after train_spectral_model() produces a general checkpoint
-# from all three sources, fine_tune_on_target_domains() continues training
-# that checkpoint using only FINE_TUNE_SOURCES, at a much lower learning
-# rate so the broad representation learned from the numerically larger
-# simulated set isn't overwritten, only specialized. It reuses the exact
-# same stratified train/val file assignment as train_spectral_model (same
-# SEED), just filtered to these sources, so the per-source validation
-# numbers already seen for them stay directly comparable before/after
-# fine-tuning.
-#
-# Restricted to just "experimental" (1273 files): simulated_close_to_experimental
-# was previously included too, but it's only 42 files, and even with the
-# oversampling ratio fixed (see the sampler comment below) it still adds
-# nothing to help experimental specifically -- it can only compete with it
-# for a share of every batch. Note this narrows what fine-tuning actually
-# specializes: simulated_close_to_experimental's share of the real test set
-# now only benefits from whatever it already got during the main run's
-# SOURCE_OVERSAMPLE_WEIGHTS-boosted training, not from this second pass.
-FINE_TUNE_SOURCES = ("experimental",)
 FINE_TUNE_MODEL_PATH = SPECTRAL_MODEL_PATH.replace(".pth", "_finetuned.pth")
 # Lowered from 1.0e-5: a real run's base checkpoint had its best epoch at an
 # LR of 6.25e-6 (ReduceLROnPlateau had already decayed it down from
@@ -206,10 +155,10 @@ FINE_TUNE_NUM_EPOCHS = 50
 # Lowered to match the same fix applied to SCHEDULER_PATIENCE/
 # EARLY_STOPPING_PATIENCE above: a real run showed the main training loop
 # overfitting fast after its validation minimum because the LR stayed
-# high for too many further epochs. Fine-tuning's own pool (FINE_TUNE_SOURCES)
-# is smaller than the main run's, so the same fast-overfit pattern is if
-# anything more likely here, not less -- this was never revisited when the
-# main run's patience was tightened.
+# high for too many further epochs. Fine-tuning's own pool (the
+# experimental files) is smaller than the main run's simulated pool, so
+# the same fast-overfit pattern is if anything more likely here, not less
+# -- this was never revisited when the main run's patience was tightened.
 FINE_TUNE_EARLY_STOPPING_PATIENCE = 8
 FINE_TUNE_SCHEDULER_PATIENCE = 2
 
@@ -614,7 +563,7 @@ def calculate_constant_baseline(train_files, val_files):
 
 
 # ============================================================
-# 4b. SOURCE-AWARE SPLIT
+# 4b. FILE-RANGE SELECTION AND SPLIT
 # ============================================================
 
 FILE_NUMBER_PATTERN = re.compile(r"(\d+)(?=\.mat$)")
@@ -623,14 +572,14 @@ FILE_NUMBER_PATTERN = re.compile(r"(\d+)(?=\.mat$)")
 def extract_file_number(file_path):
     """Extract the integer index embedded in a filename like DTOF_137.mat.
 
-    Source classification must key off this actual number, not off
-    position in a sorted(glob(...)) list: Python's sorted() on these
-    paths sorts lexicographically as strings, so e.g. "DTOF_961.mat"
-    lands alphabetically among all the "DTOF_9xx.mat"/"DTOF_9xxx.mat"
-    names rather than next to its true numeric neighbors DTOF_960.mat and
-    DTOF_962.mat. That silently scrambles any classification based on
-    sorted-list position -- exactly what SOURCE_SIMULATED_END /
-    SOURCE_EXPERIMENTAL_END assume they can use.
+    Range selection must key off this actual number, not off position in
+    a sorted(glob(...)) list: Python's sorted() on these paths sorts
+    lexicographically as strings, so e.g. "DTOF_961.mat" lands
+    alphabetically among all the "DTOF_9xx.mat"/"DTOF_9xxx.mat" names
+    rather than next to its true numeric neighbors DTOF_960.mat and
+    DTOF_962.mat. That silently scrambles any selection based on
+    sorted-list position -- exactly what SIMULATED_FILE_MAX /
+    EXPERIMENTAL_FILE_MIN / EXPERIMENTAL_FILE_MAX assume they can use.
     """
 
     basename = os.path.basename(file_path)
@@ -642,137 +591,49 @@ def extract_file_number(file_path):
     return int(match.group(1))
 
 
-def classify_source_by_file_number(file_number):
-    """Maps a file's own numeric index to its data source, per the ranges
-    documented next to SOURCE_SIMULATED_END above.
+def select_files_by_number_range(all_files, minimum_number, maximum_number):
+    """Returns the files whose own parsed number (see extract_file_number)
+    falls within [minimum_number, maximum_number], and prints a sanity
+    check of the range actually found so you can confirm it against what
+    you expect before trusting it.
     """
 
-    if file_number <= SOURCE_SIMULATED_END:
-        return "simulated"
-    if file_number <= SOURCE_EXPERIMENTAL_END:
-        return "experimental"
-    return "simulated_close_to_experimental"
+    selected = [
+        file_path for file_path in all_files
+        if minimum_number <= extract_file_number(file_path) <= maximum_number
+    ]
 
-
-def build_source_lookup(all_files):
-    """Returns {file_path: source_label}, classifying each file by the
-    numeric index parsed from its own filename (see extract_file_number),
-    and prints a sanity check of the file-number range actually observed
-    in each source so you can confirm it against what you expect before
-    trusting the split.
-    """
-
-    file_numbers = {file_path: extract_file_number(file_path) for file_path in all_files}
-
-    if len(all_files) != SOURCE_TOTAL_EXPECTED:
-        print(
-            f"\nWARNING: found {len(all_files)} training files but "
-            f"SOURCE_TOTAL_EXPECTED={SOURCE_TOTAL_EXPECTED}. The source "
-            f"boundaries (SOURCE_SIMULATED_END, SOURCE_EXPERIMENTAL_END) "
-            f"were set for a different file count -- update them or this "
-            f"split will misclassify files."
+    if not selected:
+        raise RuntimeError(
+            f"No files found with a number between {minimum_number} and "
+            f"{maximum_number} in:\n{TRAIN_DIR}"
         )
 
-    lookup = {
-        file_path: classify_source_by_file_number(file_numbers[file_path])
-        for file_path in all_files
-    }
+    numbers = sorted(extract_file_number(f) for f in selected)
+    print(
+        f"\nSelected {len(selected)} files numbered {minimum_number}-{maximum_number} "
+        f"(actual range found: {numbers[0]} to {numbers[-1]})"
+    )
 
-    print("\nSource boundary sanity check (by each file's own parsed number,")
-    print("not sorted-list position -- confirm these ranges match what you expect):")
-    for label in ("simulated", "experimental", "simulated_close_to_experimental"):
-        numbers = sorted(file_numbers[f] for f in all_files if lookup[f] == label)
-        if numbers:
-            print(f"  {label}: {len(numbers)} files, numbers {numbers[0]} to {numbers[-1]}")
-        else:
-            print(f"  {label}: 0 files")
-
-    return lookup
+    return selected
 
 
-def stratified_train_val_split(all_files, source_lookup, train_fraction=TRAIN_FRACTION, seed=SEED):
-    """Splits each data source separately so validation always contains a
-    deliberate share of every source, instead of whatever a single random
-    shuffle across all files happens to produce.
-    """
+def train_val_split(file_list, train_fraction=TRAIN_FRACTION, seed=SEED):
+    """Plain random split of one already-selected file range."""
 
-    groups = {}
-    for file_path in all_files:
-        groups.setdefault(source_lookup[file_path], []).append(file_path)
-
+    files = list(file_list)
     rng = random.Random(seed)
-    train_files, val_files = [], []
+    rng.shuffle(files)
 
-    print("\nSource-aware train/validation split")
-    for label, files in sorted(groups.items()):
-        files = list(files)
-        rng.shuffle(files)
+    n_val = max(1, int(round((1.0 - train_fraction) * len(files))))
+    n_val = min(n_val, len(files) - 1) if len(files) > 1 else 0
 
-        val_fraction = SOURCE_VAL_FRACTION_OVERRIDES.get(label, 1.0 - train_fraction)
-        n_val = int(round(val_fraction * len(files)))
-        if val_fraction > 0.0:
-            n_val = max(1, n_val)
-        n_val = min(n_val, len(files) - 1) if len(files) > 1 else 0
+    val_files = files[:n_val]
+    train_files = files[n_val:]
 
-        group_val = files[:n_val]
-        group_train = files[n_val:]
+    print(f"  {len(files)} files total -> {len(train_files)} train / {len(val_files)} val")
 
-        train_files.extend(group_train)
-        val_files.extend(group_val)
-
-        print(f"  {label}: {len(files)} files total -> "
-              f"{len(group_train)} train / {len(group_val)} val")
-
-    rng.shuffle(train_files)
-    rng.shuffle(val_files)
-
-    return train_files, val_files, groups
-
-
-def summarize_late_start_by_source(all_files, source_lookup):
-    """Prints LATE_START statistics separately per source. A large shift
-    between sources here is the IRF difference showing up directly in the
-    one quantity the tail-weighting/window mechanics depend on most.
-    """
-
-    by_source = {}
-    for file_path in all_files:
-        mat = loadmat(file_path)
-        values = load_late_start_indices(mat, file_path).reshape(-1)
-        by_source.setdefault(source_lookup[file_path], []).append(values)
-
-    print("\nLate-start statistics by source")
-    for label, value_list in sorted(by_source.items()):
-        values = np.concatenate(value_list)
-        print(
-            f"  {label}: min={values.min()}, median={np.median(values):.1f}, "
-            f"max={values.max()}, mean={values.mean():.2f}"
-        )
-
-
-def summarize_raw_target_by_source(all_files, source_lookup):
-    """Prints bottom-mua target statistics separately per source.
-
-    Raw per-source validation MAE (printed each epoch) is an absolute
-    error in physical mua units. If one source's targets simply sit at a
-    smaller absolute magnitude than another's, its raw MAE will read
-    lower even at the same *relative* accuracy -- this print lets you
-    check that directly instead of assuming "lower raw MAE" means "more
-    accurate" when comparing across sources.
-    """
-
-    by_source = {}
-    for file_path in all_files:
-        target = load_bottom_mua_target(loadmat(file_path), file_path).reshape(-1)
-        by_source.setdefault(source_lookup[file_path], []).append(target)
-
-    print("\nBottom-mua raw target statistics by source")
-    for label, value_list in sorted(by_source.items()):
-        values = np.concatenate(value_list)
-        print(
-            f"  {label}: min={values.min():.6e}, median={np.median(values):.6e}, "
-            f"max={values.max():.6e}, mean={values.mean():.6e}"
-        )
+    return train_files, val_files
 
 
 # ============================================================
@@ -859,29 +720,6 @@ def flatten_image_batch(tpsf, target=None, wavelength=None, late_start=None):
     late_start_flat = None if late_start is None else late_start.reshape(-1, 1)
 
     return tpsf_flat, target_flat, wavelength_flat, late_start_flat
-
-
-def build_per_source_val_loaders(val_files, source_lookup, wavelength_values, labels=None):
-    """One DataLoader per data source found in val_files (or just the
-    sources in `labels`, if given), for per-source diagnostic reporting.
-    """
-
-    loaders = {}
-    label_set = labels if labels is not None else sorted(set(source_lookup.values()))
-    for label in label_set:
-        source_val_files = [f for f in val_files if source_lookup[f] == label]
-        if not source_val_files:
-            continue
-        source_val_dataset = SpectralTPSFDataset(
-            file_list=source_val_files,
-            wavelength_values=wavelength_values,
-            augment=False,
-        )
-        loaders[label] = DataLoader(
-            source_val_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-        )
-    return loaders
 
 
 # ============================================================
@@ -1366,13 +1204,13 @@ def build_loss(loss_mode=LOSS_MODE):
 
 @torch.no_grad()
 def validate_spectral(model, loader, criterion, device):
-    """Note on comparing bottom_mua_mae across sources: it is an absolute
-    error in raw physical mua units, so a lower value for one source does
-    not by itself mean the model is more accurate there -- it could just
-    mean that source's targets sit at a smaller absolute magnitude (see
-    summarize_raw_target_by_source). bottom_mua_relative_mae (mean
-    |error|/target, matching RelativeMuaLoss) is scale-independent and is
-    the fairer number for cross-source comparisons.
+    """Note on comparing bottom_mua_mae across runs (e.g. the simulated-only
+    checkpoint vs. the experimental fine-tune): it is an absolute error in
+    raw physical mua units, so a lower value on one does not by itself mean
+    the model is more accurate there -- it could just mean that dataset's
+    targets sit at a smaller absolute magnitude. bottom_mua_relative_mae
+    (mean |error|/target, matching RelativeMuaLoss) is scale-independent and
+    is the fairer number for cross-run comparisons.
 
     bottom_mua_bias is the mean SIGNED error (prediction - target, not
     absolute), and bottom_mua_relative_bias is the same divided by target.
@@ -1438,7 +1276,7 @@ def update_training_curve_plot(train_history, val_history, best_epoch, output_pa
     """Overwrite a PNG of train vs. val MAE so far.
 
     Called at the end of every epoch (see train_spectral_model and
-    fine_tune_on_target_domains below), so opening output_path while
+    fine_tune_on_experimental below), so opening output_path while
     training is still running shows current progress -- no need to wait
     for training to finish or reload a checkpoint afterward.
     """
@@ -1526,16 +1364,11 @@ def train_spectral_model():
     if not all_files:
         raise FileNotFoundError(f"No training .mat files were found in:\n{TRAIN_DIR}")
 
-    source_lookup = build_source_lookup(all_files)
-    train_files, val_files, _ = stratified_train_val_split(all_files, source_lookup)
-
-    if not train_files or not val_files:
-        raise RuntimeError("Training or validation file list is empty.")
+    simulated_files = select_files_by_number_range(all_files, 1, SIMULATED_FILE_MAX)
+    train_files, val_files = train_val_split(simulated_files)
 
     summarize_raw_target(train_files)
-    summarize_raw_target_by_source(all_files, source_lookup)
     late_start_statistics = summarize_late_start_indices(train_files)
-    summarize_late_start_by_source(all_files, source_lookup)
 
     constant_prediction, constant_baseline_mae = calculate_constant_baseline(train_files, val_files)
     print(f"\nConstant bottom-mua prediction: {constant_prediction:.6e}")
@@ -1556,33 +1389,13 @@ def train_spectral_model():
     # the batch. This is automatically satisfied here since each image
     # always contributes exactly N_WAVELENGTHS contiguous rows after
     # flatten_image_batch, regardless of IMAGE_BATCH_SIZE.
-    if any(weight != 1.0 for weight in SOURCE_OVERSAMPLE_WEIGHTS.values()):
-        sample_weights = [
-            SOURCE_OVERSAMPLE_WEIGHTS[source_lookup[file_path]] for file_path in train_files
-        ]
-        train_sampler = WeightedRandomSampler(
-            sample_weights, num_samples=len(train_files), replacement=True
-        )
-        train_loader = DataLoader(
-            train_dataset, batch_size=IMAGE_BATCH_SIZE, sampler=train_sampler,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-        )
-    else:
-        train_loader = DataLoader(
-            train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-        )
+    train_loader = DataLoader(
+        train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True,
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+    )
     val_loader = DataLoader(
         val_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-    )
-
-    # Separate per-source validation loaders purely for diagnostic
-    # reporting each epoch -- the combined val_loader above still drives
-    # the scheduler and best-checkpoint selection, so switching this on
-    # does not change what "best" means.
-    per_source_val_loaders = build_per_source_val_loaders(
-        val_files, source_lookup, normalized_wavelengths
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1666,20 +1479,9 @@ def train_spectral_model():
             f"Val MAE={metrics['bottom_mua_mae']:.6e} | "
             f"Val RMSE={metrics['bottom_mua_rmse']:.6e} | "
             f"Val RelMAE={metrics['bottom_mua_relative_mae'] * 100:.2f}% | "
+            f"Val RelBias={metrics['bottom_mua_relative_bias'] * 100:+.2f}% | "
             f"LR={current_lr:.2e}"
         )
-        # RelMAE (mean |error|/target) is scale-independent, unlike raw
-        # MAE/RMSE -- use it, not raw MAE, to compare accuracy across
-        # sources whose target magnitudes may differ (see
-        # summarize_raw_target_by_source and validate_spectral's docstring).
-        for label, loader in per_source_val_loaders.items():
-            source_metrics = validate_spectral(eval_model, loader, criterion, device)
-            print(
-                f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
-                f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e} | "
-                f"Val RelMAE={source_metrics['bottom_mua_relative_mae'] * 100:.2f}% | "
-                f"Val RelBias={source_metrics['bottom_mua_relative_bias'] * 100:+.2f}%"
-            )
 
         if metrics["bottom_mua_mae"] < best_val_mae - MIN_DELTA:
             best_val_mae = metrics["bottom_mua_mae"]
@@ -1714,14 +1516,8 @@ def train_spectral_model():
         "late_start_key": LATE_START_KEY,
         "late_start_is_matlab_one_based": LATE_START_IS_MATLAB_ONE_BASED,
         "late_start_statistics": late_start_statistics,
-        "source_simulated_end": SOURCE_SIMULATED_END,
-        "source_experimental_end": SOURCE_EXPERIMENTAL_END,
-        "source_val_fraction_overrides": SOURCE_VAL_FRACTION_OVERRIDES,
-        "source_oversample_weights": SOURCE_OVERSAMPLE_WEIGHTS,
-        "source_file_counts": {
-            label: sum(1 for f in all_files if source_lookup[f] == label)
-            for label in sorted(set(source_lookup.values()))
-        },
+        "training_data": "simulated",
+        "simulated_file_max": SIMULATED_FILE_MAX,
         "temporal_filters_per_kernel": TEMPORAL_FILTERS_PER_KERNEL,
         "temporal_pool_bins": TEMPORAL_POOL_BINS,
         "temporal_feature_dim": TEMPORAL_FEATURE_DIM,
@@ -1759,17 +1555,17 @@ def train_spectral_model():
 
 
 # ============================================================
-# 14. FINE-TUNING ON THE TEST SET'S DOMAINS
+# 14. FINE-TUNING ON THE EXPERIMENTAL DATA
 # ============================================================
 
-def fine_tune_on_target_domains():
-    """Continues training an existing SPECTRAL_MODEL_PATH checkpoint using
-    only FINE_TUNE_SOURCES, at FINE_TUNE_LEARNING_RATE.
+def fine_tune_on_experimental():
+    """Continues training an existing SPECTRAL_MODEL_PATH checkpoint
+    (trained on the simulated files by train_spectral_model) using only
+    the experimental files, at FINE_TUNE_LEARNING_RATE.
 
-    Reuses the exact same stratified split (same SEED) as
-    train_spectral_model, filtered down to the target sources, so the
-    fine-tuning validation files are the same ones already reported on in
-    the general run -- results stay directly comparable before/after.
+    The simulated and experimental file ranges never overlap, so this
+    uses its own independent train/val split -- there is no shared file
+    assignment to reuse with the main run.
     """
 
     if not os.path.isfile(SPECTRAL_MODEL_PATH):
@@ -1793,18 +1589,10 @@ def fine_tune_on_target_domains():
             continue
         all_files.append(file_path)
 
-    source_lookup = build_source_lookup(all_files)
-    train_files, val_files, _ = stratified_train_val_split(all_files, source_lookup)
-
-    fine_tune_train_files = [f for f in train_files if source_lookup[f] in FINE_TUNE_SOURCES]
-    fine_tune_val_files = [f for f in val_files if source_lookup[f] in FINE_TUNE_SOURCES]
-
-    if not fine_tune_train_files or not fine_tune_val_files:
-        raise RuntimeError("No fine-tuning training or validation files found for FINE_TUNE_SOURCES.")
-
-    print(f"\nFine-tuning on sources: {FINE_TUNE_SOURCES}")
-    print(f"  Fine-tune train files: {len(fine_tune_train_files)}")
-    print(f"  Fine-tune val files:   {len(fine_tune_val_files)}")
+    experimental_files = select_files_by_number_range(
+        all_files, EXPERIMENTAL_FILE_MIN, EXPERIMENTAL_FILE_MAX
+    )
+    fine_tune_train_files, fine_tune_val_files = train_val_split(experimental_files)
 
     train_dataset = SpectralTPSFDataset(
         file_list=fine_tune_train_files,
@@ -1817,42 +1605,13 @@ def fine_tune_on_target_domains():
         augment=False,
     )
 
-    # A per-source oversampling weight only does anything when
-    # FINE_TUNE_SOURCES has more than one distinct source; with the single
-    # "experimental" source now used here, every file would get the exact
-    # same SOURCE_OVERSAMPLE_WEIGHTS multiplier, making a
-    # WeightedRandomSampler pure overhead -- and actually slightly worse
-    # than plain shuffling, since sampling-with-replacement can skip some
-    # files and repeat others within a single epoch instead of covering
-    # every file exactly once. Falls back to plain shuffling whenever only
-    # one source is present, mirroring the same fallback train_spectral_model
-    # uses when SOURCE_OVERSAMPLE_WEIGHTS has no effect.
-    fine_tune_source_labels = {source_lookup[f] for f in fine_tune_train_files}
-    if len(fine_tune_source_labels) > 1:
-        fine_tune_sample_weights = [
-            SOURCE_OVERSAMPLE_WEIGHTS[source_lookup[file_path]]
-            for file_path in fine_tune_train_files
-        ]
-        fine_tune_sampler = WeightedRandomSampler(
-            fine_tune_sample_weights, num_samples=len(fine_tune_train_files), replacement=True
-        )
-        train_loader = DataLoader(
-            train_dataset, batch_size=IMAGE_BATCH_SIZE, sampler=fine_tune_sampler,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-        )
-    else:
-        train_loader = DataLoader(
-            train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-        )
+    train_loader = DataLoader(
+        train_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=True,
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
+    )
     val_loader = DataLoader(
         val_dataset, batch_size=IMAGE_BATCH_SIZE, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, drop_last=False,
-    )
-
-    per_source_val_loaders = build_per_source_val_loaders(
-        fine_tune_val_files, source_lookup, normalized_wavelengths,
-        labels=FINE_TUNE_SOURCES,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1867,7 +1626,7 @@ def fine_tune_on_target_domains():
         f"(validation MAE {base_checkpoint.get('best_validation_bottom_mua_mae', float('nan')):.6e})."
     )
 
-    # fine_tune_on_target_domains() always starts a brand-new optimizer at
+    # fine_tune_on_experimental() always starts a brand-new optimizer at
     # FINE_TUNE_LEARNING_RATE -- it does not read or inherit whatever LR
     # the main run's ReduceLROnPlateau schedule had decayed to by the time
     # it stopped. The whole point of fine-tuning at "a much lower learning
@@ -1960,16 +1719,9 @@ def fine_tune_on_target_domains():
             f"Val MAE={metrics['bottom_mua_mae']:.6e} | "
             f"Val RMSE={metrics['bottom_mua_rmse']:.6e} | "
             f"Val RelMAE={metrics['bottom_mua_relative_mae'] * 100:.2f}% | "
+            f"Val RelBias={metrics['bottom_mua_relative_bias'] * 100:+.2f}% | "
             f"LR={current_lr:.2e}"
         )
-        for label, loader in per_source_val_loaders.items():
-            source_metrics = validate_spectral(eval_model, loader, criterion, device)
-            print(
-                f"    [{label}] Val MAE={source_metrics['bottom_mua_mae']:.6e} | "
-                f"Val RMSE={source_metrics['bottom_mua_rmse']:.6e} | "
-                f"Val RelMAE={source_metrics['bottom_mua_relative_mae'] * 100:.2f}% | "
-                f"Val RelBias={source_metrics['bottom_mua_relative_bias'] * 100:+.2f}%"
-            )
 
         if metrics["bottom_mua_mae"] < best_val_mae - MIN_DELTA:
             best_val_mae = metrics["bottom_mua_mae"]
@@ -1996,7 +1748,9 @@ def fine_tune_on_target_domains():
     fine_tune_checkpoint.update({
         "model_state_dict": best_state,
         "architecture": "bottom_mua_depth_resolved_spectral_smoothing_finetuned",
-        "fine_tune_sources": FINE_TUNE_SOURCES,
+        "fine_tune_data": "experimental",
+        "experimental_file_min": EXPERIMENTAL_FILE_MIN,
+        "experimental_file_max": EXPERIMENTAL_FILE_MAX,
         "fine_tune_learning_rate": FINE_TUNE_LEARNING_RATE,
         "fine_tune_base_checkpoint": SPECTRAL_MODEL_PATH,
         "fine_tune_best_epoch": best_epoch,
@@ -2015,6 +1769,6 @@ def fine_tune_on_target_domains():
 
 if __name__ == "__main__":
     if RUN_FINE_TUNING:
-        fine_tune_on_target_domains()
+        fine_tune_on_experimental()
     else:
         train_spectral_model()

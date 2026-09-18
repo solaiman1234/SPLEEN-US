@@ -404,81 +404,30 @@ always-normalized data. `MAX_TIME_SHIFT` and `ADDITIVE_NOISE_STD` are
 unaffected by AUC normalization (timing jitter and per-bin measurement
 noise are still real regardless of integral scale) and are kept.
 
-## Fine-tuning toward the test set's domains
+## Fine-tuning toward the experimental data
 
-The real test set is experimental phantoms plus a subset of
-`simulated_close_to_experimental`, and not `simulated`, which is only
-there to teach the model general DTOF-to-mua structure from an
-abundantly large dataset. `fine_tune_on_target_domains()` is a second
-training phase: it loads the checkpoint `train_spectral_model()` already
-produced, then continues training it using only `FINE_TUNE_SOURCES`, at
-a much lower learning rate (`FINE_TUNE_LEARNING_RATE = 2e-6`) so the
-broad representation learned from the numerically larger simulated set
-is specialized rather than overwritten. See "Fine-tuning always starts a
-fresh optimizer -- LR mismatch check" below for why this needs to stay
-below whatever LR the base run actually converged at, not just below its
-starting `LEARNING_RATE`.
-
-It reuses the exact same stratified train/val file assignment as
-`train_spectral_model` (same `SEED`), just filtered down to
-`FINE_TUNE_SOURCES`, so the fine-tuning validation files are the
-identical ones already reported on in the general run -- before/after
-numbers stay directly comparable.
-
-`FINE_TUNE_SOURCES` was originally `("experimental",
-"simulated_close_to_experimental")` -- both sources the real test set
-draws from. It's now restricted to `("experimental",)` (1273 files): even
-after fixing the oversampling ratio below, pooling in the tiny 42-file
-`simulated_close_to_experimental` source still meant it was competing
-with `experimental` for a share of every batch, for a source that's a
-small fraction of the real test set. Narrowing to `experimental` alone
-lets every fine-tuning step go toward the source that's actually been the
-persistent problem. The trade-off: `simulated_close_to_experimental`'s
-share of the real test set no longer gets a second, fine-tuning-specific
-pass -- it still benefits from `SOURCE_OVERSAMPLE_WEIGHTS` during the main
-run, just not from this stage.
-
-### Fine-tuning's sampler, and the equalization bug it once had
-
-When `FINE_TUNE_SOURCES` held two sources, a per-source oversampling
-weight was needed: `experimental` outnumbered
-`simulated_close_to_experimental` roughly 30:1, so a plain shuffled loader
-would have filled nearly every batch with `experimental` rows. The
-sampler went through two versions:
-
-1. **Original**: weighted each sample by `1 / (its source's file count)`,
-   giving every source exactly equal **total** sampling mass per epoch
-   regardless of size. At a 30:1 imbalance that meant each
-   `simulated_close_to_experimental` file was drawn roughly 27x more often
-   per epoch than each `experimental` file. A real run showed exactly the
-   failure that predicts: `simulated_close_to_experimental`'s validation
-   MAE improved (consistent with the model memorizing its ~38
-   heavily-repeated training files) while `experimental`'s -- the actual
-   real-phantom target -- did not move at all, since it was getting less
-   than half its previous per-epoch exposure to make room for that
-   oversampling.
-2. **Fixed**: reused the same fixed per-source multipliers
-   `SOURCE_OVERSAMPLE_WEIGHTS` already uses for the main run
-   (`experimental: 2.0`, `simulated_close_to_experimental: 3.0`, applied
-   per file rather than divided by count) -- a much milder ~1.5x per-file
-   ratio instead of ~27x.
-
-Now that `FINE_TUNE_SOURCES` is just `("experimental",)`, this whole
-mechanism is moot: every file gets the same multiplier, so
-`fine_tune_on_target_domains()` skips the `WeightedRandomSampler` entirely
-and falls back to plain shuffling whenever only one source is present --
-the same fallback `train_spectral_model` already uses when
-`SOURCE_OVERSAMPLE_WEIGHTS` has no effect. A `WeightedRandomSampler` with
-identical weights for every file would have been pure overhead, and
-slightly worse than plain shuffling besides, since sampling-with-replacement
-can skip some files and repeat others within a single epoch instead of
-covering every file exactly once.
+`fine_tune_on_experimental()` is a second training phase: it loads the
+checkpoint `train_spectral_model()` already produced, then continues
+training it using only the experimental files, at a much lower learning
+rate (`FINE_TUNE_LEARNING_RATE = 2e-6`) so the broad representation
+learned from the simulated set is specialized rather than overwritten.
+See "Fine-tuning always starts a fresh optimizer -- LR mismatch check"
+below for why this needs to stay below whatever LR the base run actually
+converged at, not just below its starting `LEARNING_RATE`.
 
 Set `RUN_FINE_TUNING = True` and run this file to fine-tune the checkpoint
 already saved at `SPECTRAL_MODEL_PATH` instead of training a new one from
 scratch; the result is saved separately to `FINE_TUNE_MODEL_PATH`
 (`SPECTRAL_MODEL_PATH` with `_finetuned` appended), so both the general
 and fine-tuned checkpoints are kept for comparison.
+
+See "Simplified to a clean two-phase curriculum" below for how this
+pipeline evolved from three mixed data sources (with source-aware
+splitting, per-source oversampling, and a two-source fine-tuning pool) to
+the current design: `train_spectral_model()` trains on simulated files
+only, `fine_tune_on_experimental()` fine-tunes on experimental files
+only, and the two ranges never overlap so there's no cross-source
+competition to manage in either phase.
 
 ## Code review fixes (no training-behavior change from the above)
 
@@ -878,3 +827,60 @@ don't improve.
 lowered `10 -> 8`, mirroring the main run's fix so the fine-tuning LR
 backs off sooner after validation stops improving instead of continuing
 to overfit at full LR for several more epochs.
+
+## Simplified to a clean two-phase curriculum
+
+The pipeline originally trained on all three sources mixed together
+(`simulated`, `experimental`, `simulated_close_to_experimental`) in one
+run, with source-aware stratified splitting and `SOURCE_OVERSAMPLE_WEIGHTS`
+needed to keep `simulated`'s ~64% file-share from dominating every epoch's
+gradient. Fine-tuning then specialized toward `experimental` +
+`simulated_close_to_experimental` (later narrowed to `experimental` alone,
+see "Fine-tuning toward the experimental data" above), with its own
+`WeightedRandomSampler` to manage the imbalance between those two sources.
+
+That's a lot of machinery whose entire purpose was managing competition
+between sources sharing the same training run. Since the real goal is
+"pretrain on simulated, then specialize on experimental" -- exactly what
+fine-tuning was already doing structurally -- the pipeline is simplified
+to match that directly:
+
+- `train_spectral_model()` now trains on **only** the simulated files
+  (numbered 1 to `SIMULATED_FILE_MAX = 2300`). No source classification,
+  no stratified split, no `SOURCE_OVERSAMPLE_WEIGHTS`, no per-source
+  validation loaders -- just a plain 80/20 random split within that one
+  file range.
+- `fine_tune_on_experimental()` (renamed from `fine_tune_on_target_domains`)
+  loads that checkpoint and continues training on **only** the
+  experimental files (numbered `EXPERIMENTAL_FILE_MIN = 2301` to
+  `EXPERIMENTAL_FILE_MAX = 3573`), again with a plain 80/20 split -- no
+  sampler needed since there's only ever one source in this phase either.
+- `simulated_close_to_experimental` (files numbered above 3573) is no
+  longer used by either phase. It historically existed to bridge the
+  domain gap when fine-tuning pooled it with `experimental`, but once
+  fine-tuning was narrowed to `experimental` alone, it had already stopped
+  contributing to fine-tuning specifically -- dropping it from the main
+  run too removes the last place it was adding source-management
+  complexity for comparatively little benefit. It can be reintroduced
+  later (e.g. as a third phase, or added back into one of the two ranges)
+  if its bridging role turns out to matter after evaluating this simpler
+  version.
+
+Removed entirely: `SOURCE_SIMULATED_END`, `SOURCE_EXPERIMENTAL_END`,
+`SOURCE_TOTAL_EXPECTED`, `SOURCE_VAL_FRACTION_OVERRIDES`,
+`SOURCE_OVERSAMPLE_WEIGHTS`, `FINE_TUNE_SOURCES`,
+`classify_source_by_file_number`, `build_source_lookup`,
+`stratified_train_val_split`, `summarize_late_start_by_source`,
+`summarize_raw_target_by_source`, `build_per_source_val_loaders`, and the
+`WeightedRandomSampler` import (no longer used anywhere). `extract_file_number`
+is kept (still needed to select files by their numeric range) alongside
+two new, much smaller helpers: `select_files_by_number_range()` and
+`train_val_split()`.
+
+One consequence worth knowing: because the two phases now use disjoint,
+non-overlapping file ranges with independent random splits, there's no
+shared "same validation files across phases" guarantee to reason about
+any more (train_spectral_model's validation files are simulated;
+fine_tune_on_experimental's are experimental) -- each phase's validation
+number is only ever compared against its own checkpoint's history, not
+against the other phase's.
